@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(grep -oE '\\\\b[A-Z]{2,6}[0-9]*\\\\b' \"/Users/mkevelasco/Desktop/2026_projects/smart_email/docs/03-technical-design.md\")",
-      "Bash(grep -n -i \"our pipeline\\\\|our \\\\`/insights\\\\`\\\\|the pipeline\\\\|our \\\\/insights\" 02-value-proposition.md)",
-      "Bash(grep *)"
-    ]
-  }
-}

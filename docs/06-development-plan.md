@@ -2,7 +2,7 @@
 
 > **ECHO** (Email Classification & Handling Orchestrator) — an automated email triage, classification, and insights pipeline.
 
-> Status: Phases 1-7 drafted — doc06 complete. Remaining: doc08 (pytest-guide).
+> Status: All 8 docs reviewed and approved (2026-06-14). Phase 1 scaffold created. Next: Phase 2 (`shared-utils` layer, `retry_config.py`) in Teaching Mode — Mike writes, `pmc` for full code.
 
 ## Overview
 
@@ -48,11 +48,16 @@ smart_email/
 │       └── shared_utils/
 │           └── requirements.txt     # boto3/botocore + aws-xray-sdk pinned (doc05 §4.4, FR13)
 ├── tests/                            # mirrors src/ — kept separate so test files
-│   ├── lambda_ingest/               # aren't bundled into Lambda .zip/layer
-│   ├── lambda_triage/               # artifacts by doc05 §4.6's packaging step
+│   ├── __init__.py                  # tests/ + every subdir below is a package —
+│   ├── lambda_ingest/               # aren't bundled into Lambda .zip/layer    avoids pytest basename collisions
+│   │   └── __init__.py              # artifacts by doc05 §4.6's packaging step (3x test_handler.py, doc08 §3)
+│   ├── lambda_triage/
+│   │   └── __init__.py
 │   ├── lambda_insights/
+│   │   └── __init__.py
 │   ├── layers/
 │   │   └── shared_utils/
+│   │       └── __init__.py
 │   └── conftest.py                  # shared fixtures (doc08)
 └── infra/
     ├── modules/
@@ -194,7 +199,7 @@ Helper: `build_eml(**kwargs) -> bytes` constructs test messages via `EmailMessag
 - **Module-level boto3 clients + moto timing**: `s3`/`sqs` clients are constructed at module import time (standard Lambda warm-start reuse pattern, per NFR1). For tests, `@mock_aws` must be active **before** these clients are constructed, or they'll attempt real AWS calls. Tests work around this with `importlib.reload(handler)` inside an active `mock_aws()` context — this is the "botocore patching" pattern doc08 needs to document centrally.
 - Failure handling: Lambda #1 is invoked **async by S3** (not SQS) — if `handler()` raises, Lambda's built-in async retries (2 retries) + the on-failure destination (`ops-alarms` SNS, doc03 §5.5, wired in Terraform) handle it. **No try/except needed in `handler.py`** — let exceptions propagate (RAISE).
 - **X-Ray annotation** (FR13, doc03 §8.9): Lambda's Active Tracing (enabled in Phase 6's Terraform) creates the invocation's segment automatically — application code attaches an `email_id` annotation to that segment via `aws_xray_sdk.core.xray_recorder.put_annotation("email_id", email_id)`. Outside Lambda (pytest), no segment exists; `xray_recorder.configure(context_missing="LOG_ERROR")` (set once at module import) makes `put_annotation` log-and-continue instead of raising `SegmentNotFoundException` — so this call needs no dedicated test fixture.
-- Flag for doc08: `pythonpath` needs `src/lambda_ingest/` added (alongside Phase 2's `src/layers/shared_utils/`) so `from mime_parser import parse_email` and `from retry_config import GENERAL_CONFIG` both resolve bare, matching the `/opt/python` + `/var/task` Lambda runtime layout.
+- Resolved in doc08 §4.4: `src/lambda_ingest/` is **not** added to `pytest.ini`'s global `pythonpath` (alongside Phase 2's `src/layers/shared_utils/`) — all 3 Lambdas have a same-named `handler.py`, so a global addition would create import collisions once `lambda_triage`/`lambda_insights` tests also run. Instead, the `ingest_handler` fixture uses `monkeypatch.syspath_prepend()` + `sys.modules.pop("handler", None)` to resolve `handler` to *this* Lambda's file each test — mirroring `/var/task`'s per-Lambda isolation. `from mime_parser import parse_email` resolves via that same prepended path; `from retry_config import GENERAL_CONFIG` resolves via Phase 2's global `pythonpath` entry.
 
 **Test** (`tests/lambda_ingest/test_handler.py`)
 
@@ -856,7 +861,7 @@ Story format: **Scope** (doc04 pointer) → **Inputs → Outputs** → **Build o
 
 - `terraform validate` — each execution-role policy is a literal transcription of doc03 §6.1-6.3. Highest-risk typo: Lambda#2's policy has 7 statements total (SQS, Comprehend, Bedrock, DynamoDB, SNS, Logs, X-Ray) — easy to drop one. Cross-check statement counts against doc03 §6.2 as part of "Green."
 - `checkov` will likely flag the `comprehend:DetectPiiEntities` and `xray:Put*` `Resource: "*"` statements (wildcard-resource findings, e.g. `CKV_AWS_111`/`CKV_AWS_107`-style). doc03 §6 already documents both as **AWS-imposed** — no resource-level permissions exist for these actions, so `Resource: "*"` isn't a choice. Suppress with `#checkov:skip=<ID>: AWS-imposed wildcard, doc03 §6`.
-- `checkov` may also flag `ECHOGitHubActionsRole`'s broad `s3:*`/`dynamodb:*`/`lambda:*`/etc. statements vs. enumerated actions. doc05 §5.4 already documents the rationale (Terraform deployer needs full lifecycle management of resources it created, scoped to `echo-*`/`ECHO*` naming); suppress with a pointer to doc05 §5.4 rather than enumerating ~50 actions per service.
+- `checkov` may also flag `ECHOGitHubActionsRole`'s broad `s3:*`/`dynamodb:*`/`lambda:*`/etc. statements vs. enumerated actions. doc05 §5.4 already documents the rationale (Terraform deployer needs full lifecycle management of resources it created, scoped to literal/`echo-*`/`ECHO*` resource names); suppress with a pointer to doc05 §5.4 rather than enumerating ~50 actions per service.
 - `terraform plan` — `data.tls_certificate.github_oidc`'s `thumbprint_list` requires a live HTTPS request to `token.actions.githubusercontent.com` at plan time, not just an AWS API read. First `data` source in the project with an external network dependency — if that endpoint is unreachable, `plan` fails here, not just `apply`.
 
 **Design notes**:
@@ -1059,4 +1064,4 @@ when fully deployed, testing process order
 
 ---
 
-doc06 complete — Phases 1-7 drafted. Remaining: doc08 (pytest-guide).
+doc06 complete — Phases 1-7 drafted. doc07 (future enhancements) and doc08 (pytest-guide) also drafted. All 8 docs reviewed and approved (2026-06-14) — Phase 1 scaffold created; Phase 2 starts next in Teaching Mode.

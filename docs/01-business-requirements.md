@@ -39,6 +39,14 @@ Customer support teams receive a continuous stream of inbound emails that are tr
 | FR16 | The `/insights` API shall require AWS IAM authorization (SigV4-signed requests); unauthenticated requests shall be rejected (HTTP 403)                        |
 | FR17 | If classification fails after retries, the system shall persist a degraded placeholder record (`category=unclassified`, `review_status=needs_review`) rather than dropping the email, and emit a failure metric |
 
+### FR4 Classification Taxonomy
+
+| Field | Values | Notes |
+| --- | --- | --- |
+| `category` | `bug_report` \| `feature_request` \| `general_inquiry` \| `billing` \| `complaint` \| `praise` \| `unclassified` | `unclassified` is reserved for FR17's degraded record — never an LLM output |
+| `sentiment` | `positive` \| `negative` \| `constructive` \| `unknown` | `constructive` = critical tone paired with an actionable suggestion (e.g., a feature request or bug report raised diplomatically); `unknown` is reserved for FR17's degraded record |
+| `confidence` | `high` \| `medium` \| `low` | LLM self-reported; drives `review_status` routing (FR9, doc03 §3.1 DR5) |
+
 ## 4. Non-Functional Requirements
 
 | ID   | Category      | Requirement                                                                                                                                                                                                                      |

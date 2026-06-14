@@ -145,7 +145,7 @@ Fully serverless, no VPC. Every component is either an AWS-managed service endpo
 11. Lambda #2 sends the redacted body to Bedrock (Claude Haiku) with a prompt requesting the structured classification JSON (category, urgency, sentiment, confidence, suggested_reply, feature_tags).
 12. *(Layer 2 retry)* If the response isn't valid JSON matching the schema, retry once with a corrective prompt. If both attempts fail, fall back to the FR17 degraded record (`category=unclassified`, `urgency=medium`, `sentiment=unknown`, `confidence=low`, `suggested_reply=null`) and emit `ClassificationFailure`.
 13. Lambda #2 applies the FR7 keyword override: if the redacted body/subject contains any urgency-escalation keyword (§3.2), force `urgency=high` and set `urgency_override_applied=true`.
-14. Lambda #2 sets `review_status` = `needs_review` if `confidence != high` (or step 12 degraded), else `auto_processed`.
+14. Lambda #2 sets `review_status` = `needs_review` if `confidence != high` (or step 12 degraded), else `auto_processed`. Routing is binary on `confidence` (`high` vs. not-`high`) — `medium` and `low` both route to `needs_review`; the 3-value scale (doc01 FR4 taxonomy, §8.5) is preserved in the persisted record for `/insights` diagnostics, not for routing.
 15. Lambda #2 `PutItem`s the full record into `EmailTriageResults` (PK=`email_id`, plus `processed_at`, `ttl`).
 16. Lambda #2 emits EMF metrics: sentiment counts, PII-entity count, and `ClassificationFailure` if applicable.
 17. Lambda #2 publishes to `alert-topic` SNS with message attribute `alert_type` = `urgent` | `needs_review` | `none`. Subscribers use filter policies to receive only relevant alert types.
@@ -432,7 +432,7 @@ General notes:
       "Sid": "TriageRecordAccess",
       "Effect": "Allow",
       "Action": ["dynamodb:GetItem", "dynamodb:PutItem"],
-      "Resource": "arn:aws:dynamodb:us-east-1:<ACCOUNT_ID>:table/EmailTriageResults"
+      "Resource": "arn:aws:dynamodb:us-east-1:<ACCOUNT_ID>:table/EmailTriageResults-${var.env}"
       // GetItem = idempotency check (§4.6); PutItem = persist classification (FR8).
     },
     {
@@ -467,7 +467,7 @@ General notes:
       "Sid": "ScanTriageRecords",
       "Effect": "Allow",
       "Action": "dynamodb:Scan",
-      "Resource": "arn:aws:dynamodb:us-east-1:<ACCOUNT_ID>:table/EmailTriageResults"
+      "Resource": "arn:aws:dynamodb:us-east-1:<ACCOUNT_ID>:table/EmailTriageResults-${var.env}"
     },
     {
       "Sid": "InvokeSynthesisModel",

@@ -281,7 +281,7 @@ A `push` to `main` (§4.7's terraform-apply, the only trigger per §3) produces 
 
 ### 5.4 Permissions Policy — `ECHOGitHubActionsRole`
 
-This is the **Terraform deployer** role — broader than any of doc03 §6's Lambda execution-role policies, since it must create/update/delete every resource across all 12 modules (doc04 §1.1). Scoped by the `echo-*`/`ECHO*` naming convention wherever AWS supports resource-level ARNs; account/region-level singletons (CloudTrail, Config, GuardDuty, Security Hub — doc04 §1.3) can't be name-scoped and are necessarily broader.
+This is the **Terraform deployer** role — broader than any of doc03 §6's Lambda execution-role policies, since it must create/update/delete every resource across all 12 modules (doc04 §1.1). Scoped by literal resource names where doc04 §2 fixes them (SQS/SNS/Lambda use the `email-*` naming from doc03 §6), or by the `echo-*`/`ECHO*` naming convention (S3 buckets, IAM roles) wherever AWS supports resource-level ARNs; account/region-level singletons (CloudTrail, Config, GuardDuty, Security Hub — doc04 §1.3) can't be name-scoped and are necessarily broader.
 
 ```json
 {
@@ -308,7 +308,7 @@ This is the **Terraform deployer** role — broader than any of doc03 §6's Lamb
       "Sid": "DynamoDBTable",
       "Effect": "Allow",
       "Action": "dynamodb:*",
-      "Resource": "arn:aws:dynamodb:us-east-1:<ACCOUNT_ID>:table/EmailTriageResults"
+      "Resource": "arn:aws:dynamodb:us-east-1:<ACCOUNT_ID>:table/EmailTriageResults-${var.env}"
       // single named table - full table-management + the demo-data module's seed-item writes
     },
     {
@@ -316,18 +316,25 @@ This is the **Terraform deployer** role — broader than any of doc03 §6's Lamb
       "Effect": "Allow",
       "Action": "lambda:*",
       "Resource": [
-        "arn:aws:lambda:us-east-1:<ACCOUNT_ID>:function:echo-*",
-        "arn:aws:lambda:us-east-1:<ACCOUNT_ID>:layer:echo-*",
-        "arn:aws:lambda:us-east-1:<ACCOUNT_ID>:layer:echo-*:*"
+        "arn:aws:lambda:us-east-1:<ACCOUNT_ID>:function:email-ingest",
+        "arn:aws:lambda:us-east-1:<ACCOUNT_ID>:function:email-triage",
+        "arn:aws:lambda:us-east-1:<ACCOUNT_ID>:function:email-insights",
+        "arn:aws:lambda:us-east-1:<ACCOUNT_ID>:layer:shared-utils",
+        "arn:aws:lambda:us-east-1:<ACCOUNT_ID>:layer:shared-utils:*"
       ]
-      // function/layer names prefixed echo- by the lambda module's naming convention
+      // 3 function names per doc03 §6.1-6.3; single shared-utils layer (doc04 §2 row 13)
     },
     {
       "Sid": "SQSAndSNS",
       "Effect": "Allow",
       "Action": ["sqs:*", "sns:*"],
-      "Resource": ["arn:aws:sqs:us-east-1:<ACCOUNT_ID>:echo-*", "arn:aws:sns:us-east-1:<ACCOUNT_ID>:echo-*"]
-      // main queue + DLQ, alert + ops-alarms topics - all echo-* named
+      "Resource": [
+        "arn:aws:sqs:us-east-1:<ACCOUNT_ID>:email-triage-queue",
+        "arn:aws:sqs:us-east-1:<ACCOUNT_ID>:email-triage-dlq",
+        "arn:aws:sns:us-east-1:<ACCOUNT_ID>:alert-topic",
+        "arn:aws:sns:us-east-1:<ACCOUNT_ID>:ops-alarms"
+      ]
+      // main queue + DLQ, alert + ops-alarms topics - literal names per doc04 §2 rows 3-4
     },
     {
       "Sid": "SES",
