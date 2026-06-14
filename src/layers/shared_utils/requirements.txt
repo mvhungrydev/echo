@@ -1,1 +1,4 @@
 # TODO: Phase 2 — pinned boto3/botocore + aws-xray-sdk (doc05 §4.4, FR13)
+boto3==1.40.*
+botocore==1.40.*
+aws-xray-sdk==2.15.0
