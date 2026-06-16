@@ -8,9 +8,8 @@ sys.path.insert(
 from email.message import EmailMessage
 from mime_parser import parse_email
 
+
 # %%
-
-
 def build_eml(**kwargs) -> bytes:
     body = kwargs.pop("body", "Email body content not provided.")
     html_body = kwargs.pop("html_body", None)
@@ -33,39 +32,82 @@ def build_eml(**kwargs) -> bytes:
 
 # %%
 
-# %%
+from_address = "Jane Doe <jane@example.com>"
+subject = "Test Email"
+text_body = "This is a test email."
 
 
 def test_simple_plain_text_email():
-    # 1: simple plain text email -> body is the plain text
-    pass
+    # 1: simple plain text email -> returns correct from_address, subject, body
+    test_mail = build_eml(
+        From=from_address,
+        Subject=subject,
+        body=text_body,
+    )
+    result = parse_email(test_mail)
+    assert result["from_address"] == "jane@example.com"
+    assert result["subject"] == "Test Email"
+    assert result["body"] == "This is a test email.\n"
 
 
 def test_multipart_alternative_returns_plain_body():
-    # 2: plain+html -> body is the plain part
-    pass
+    # 2: multipart/alternative with text and HTML -> returns text body
+    html_body = "<html><body><p>This is a test email.</p></body></html>"
+    test_mail = build_eml(
+        From=from_address,
+        Subject=subject,
+        body=text_body,
+        html_body=html_body,
+    )
+    result = parse_email(test_mail)
+    assert result["body"] == "This is a test email.\n"
 
 
 def test_base64_body_decoded():
-    # 3: Content-Transfer-Encoding: base64 -> decoded to original text
-    pass
+    # 3: base64 encoded body -> decoded text body
+    test_mail = build_eml(
+        From=from_address,
+        Subject=subject,
+        body=text_body,
+        cte="base64",
+    )
+    result = parse_email(test_mail)
+    assert result["body"] == "This is a test email.\n"
 
 
 def test_quoted_printable_body_decoded():
-    # 4: Content-Transfer-Encoding: quoted-printable -> decoded to original text
-    pass
+    # 4: quoted-printable encoded body -> decoded text body
+    test_mail = build_eml(
+        From=from_address,
+        Subject=subject,
+        body=text_body,
+        cte="quoted-printable",
+    )
+    result = parse_email(test_mail)
+    assert result["body"] == "This is a test email.\n"
 
 
 def test_rfc2047_encoded_subject_decoded():
     # 5: RFC 2047 encoded-word subject -> decoded readable string
-    pass
+    encoded_subject = "Héllo Café ☕"
+    raw = build_eml(From=from_address, Subject=encoded_subject, body=text_body)
+    result = parse_email(raw)
+    assert result["subject"] == encoded_subject
 
 
 def test_from_header_strips_display_name():
     # 6: From: "Jane Doe" <jane@example.com> -> from_address == "jane@example.com"
-    pass
+    test_mail = build_eml(
+        From="Jane Doe <jane@example.com>", Subject=subject, body=text_body
+    )
+    result = parse_email(test_mail)
+    assert result["from_address"] == "jane@example.com"
 
 
 def test_attachment_only_email_returns_empty_body():
     # 7: boundary - no body part -> body == "", no exception
-    pass
+    test_mail = build_eml(
+        From=from_address, Subject=subject, body=text_body, attachment_only=True
+    )
+    result = parse_email(test_mail)
+    assert result["body"] == ""
