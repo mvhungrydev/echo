@@ -28,7 +28,7 @@ os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
 def build_eml(
     from_addr="Jane Doe <jane@example.com>",
     subject="Test Email",
-    body="This is a test email.",
+    body="This is a test email % @.(printable ASCII chars) \n",
     html_body=None,
 ):
     msg = EmailMessage()
@@ -149,7 +149,7 @@ def test_happy_path_plain_text_email():
     assert payload["email_id"] == "test-msg-001"
     assert payload["from_address"] == "jane@example.com"
     assert payload["subject"] == "Test Email"
-    assert payload["body"] == "This is a test email.\n"
+    assert payload["body"] == "This is a test email % @.(printable ASCII chars) \n"
     assert payload["raw_s3_key"] == key
     # can't assert exact timestamp — just verify the field was populated
     assert payload["received_at"] != ""
@@ -350,18 +350,44 @@ def test_multipart_email_body_extracted():
 
     # multipart email with both text/plain and text/html parts
     # handler should extract the text/plain part as the "body" in the SQS payload
-    assert payload["body"] == "This is a test email.\n"
+    assert payload["body"] == "This is a test email % @.(printable ASCII chars) \n"
 
 
 # ── test 7 ────────────────────────────────────────────────────────────────────
 
 
+# %%
 def test_sqs_message_json_serializable():
     mock = mock_aws()
     mock.start()
     s3, sqs, queue_url, handler = _setup()
-    # SQS MessageBody round-trips through json.loads() without error
-    pass
+    s3.put_object(
+        Bucket=BUCKET,
+        Key="raw-emails/test-msg-007",
+        Body=build_eml().as_bytes(),
+    )
+    event = {
+        "Records": [
+            {
+                "s3": {
+                    "bucket": {"name": BUCKET},
+                    "object": {"key": "raw-emails/test-msg-007"},
+                }
+            }
+        ]
+    }
+
+    # Test local handler in isolation first — avoids Lambda-specific layers of complexity while verifying core logic
+    local_handler(event, None, s3, sqs, queue_url)
+
+    # End of local handler test — now replicate the full Lambda invocation to verify the final SQS payload
+    handler.handler(event, None)
+
+    response = sqs.receive_message(QueueUrl=queue_url)
+    print("Received SQS message:", response)
+    payload = json.loads(response["Messages"][0]["Body"])
+    assert isinstance(payload, dict)
+    mock.stop()
 
 
 # ── test 8 ────────────────────────────────────────────────────────────────────
