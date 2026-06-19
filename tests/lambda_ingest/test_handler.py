@@ -29,11 +29,14 @@ def build_eml(
     from_addr="Jane Doe <jane@example.com>",
     subject="Test Email",
     body="This is a test email.",
+    html_body=None,
 ):
     msg = EmailMessage()
     msg["From"] = from_addr
     msg["Subject"] = subject
     msg.set_content(body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
     return msg
 
 
@@ -320,8 +323,34 @@ def test_multipart_email_body_extracted():
     mock = mock_aws()
     mock.start()
     s3, sqs, queue_url, handler = _setup()
-    pass
+    s3.put_object(
+        Bucket=BUCKET,
+        Key="raw-emails/test-msg-006",
+        Body=build_eml(
+            html_body="<p>This is the HTML part of the email.</p>"
+        ).as_bytes(),
+    )
+    event = {
+        "Records": [
+            {
+                "s3": {
+                    "bucket": {"name": BUCKET},
+                    "object": {"key": "raw-emails/test-msg-006"},
+                }
+            }
+        ]
+    }
+    # Test local handler in isolation first — avoids Lambda-specific layers of complexity while verifying core logic
+    local_handler(event, None, s3, sqs, queue_url)
+    # End of local handler test — now replicate the full Lambda invocation to verify the final SQS payload
+    handler.handler(event, None)
+    response = sqs.receive_message(QueueUrl=queue_url)
+    payload = json.loads(response["Messages"][0]["Body"])
     mock.stop()
+
+    # multipart email with both text/plain and text/html parts
+    # handler should extract the text/plain part as the "body" in the SQS payload
+    assert payload["body"] == "This is a test email.\n"
 
 
 # ── test 7 ────────────────────────────────────────────────────────────────────
