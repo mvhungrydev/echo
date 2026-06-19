@@ -67,6 +67,7 @@ def _setup():
 def local_handler(event, context, s3, sqs, queue_url):
     from mime_parser import parse_email
 
+    print("recieved event:", event)
     # lamanda code starts here
     record = event["Records"][0]["s3"]
 
@@ -105,7 +106,7 @@ def local_handler(event, context, s3, sqs, queue_url):
         del payload[
             "body"
         ]  # omit body from payload if poison pill — signals triage to skip NLP processing
-
+    print("sending payload to SQS, with body omitted:", payload)
     sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(payload))
 
 
@@ -152,85 +153,173 @@ def test_happy_path_plain_text_email():
     mock.stop()
 
 
-# %% develop test 1 interactively
-# with mock_aws():
-#     s3, sqs, queue_url, handler = _setup()
-#     key = "raw-emails/test-msg-001"
-#     s3.put_object(Bucket=BUCKET, Key=key, Body=build_eml().as_bytes())
-#     event = {"Records": [{"s3": {"bucket": {"name": BUCKET}, "object": {"key": key}}}]}
-#     handler.handler(event, None)
-#     response = sqs.receive_message(QueueUrl=queue_url)
-#     payload = json.loads(response["Messages"][0]["Body"])
-#     print(payload)
-
-
+# %%
 # ── test 2 ────────────────────────────────────────────────────────────────────
-
-
 def test_email_id_derived_from_s3_key():
-    with mock_aws():
-        s3, sqs, queue_url, handler = _setup()
-        # S3 key = "raw-emails/<msgid>" -> payload["email_id"] == "<msgid>"
-        pass
+    print("Running test_email_id_derived_from_s3_key...")
+    mock = mock_aws()
+    mock.start()
+    print("test setup starting")
+    s3, sqs, queue_url, handler = _setup()
+    # S3 key can have multiple path segments, but email_id is always the final segment after the last "/"
+    key = "raw-emails/2024/06/test-msg-002"
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=build_eml().as_bytes(),
+    )
+    event = {"Records": [{"s3": {"bucket": {"name": BUCKET}, "object": {"key": key}}}]}
+
+    print("S3 object uploaded with key:", key)
+    # The email_id should be derived from the final segment of the S3 key
+    print("test setup complete, invoking handler...")
+
+    # Test local handler in isolation first — avoids Lambda-specific layers of complexity while verifying core logic
+    local_handler(event, None, s3, sqs, queue_url)
+    # End of local handler test — now replicate the full Lambda invocation to verify the final SQS payload
+
+    # Real Lambda invocation would have the handler read from SQS after processing the S3 event;
+    # replicate that here to verify the final SQS payload
+    handler.handler(event, None)
+
+    response = sqs.receive_message(QueueUrl=queue_url)
+    print("Received SQS message:", response)
+    # SQS returns Body as a raw JSON string, not a dict — must deserialize
+    payload = json.loads(response["Messages"][0]["Body"])
+    assert payload["email_id"] == "test-msg-002"
+    mock.stop()
 
 
+# %%
 # ── test 3 ────────────────────────────────────────────────────────────────────
-
-
 def test_url_encoded_s3_key_resolved():
-    with mock_aws():
-        s3, sqs, queue_url, handler = _setup()
-        # S3 key contains URL-encoded chars (e.g. %20 / +)
-        # handler must still fetch the object and derive the correct email_id
-        pass
+    print("Running test_url_encoded_s3_key_resolved...")
+    mock = mock_aws()
+    mock.start()
+    print("test setup starting")
+    s3, sqs, queue_url, handler = _setup()
+    s3.put_object(
+        Bucket=BUCKET,
+        Key="raw-emails/test msg 003",  # S3 key
+        Body=build_eml().as_bytes(),
+    )
+    event = {
+        "Records": [
+            {
+                "s3": {
+                    "bucket": {"name": BUCKET},
+                    "object": {"key": "raw-emails/test%20msg%20003"},
+                }
+            }
+        ]
+    }
+
+    # S3 key contains URL-encoded chars (e.g. %20 / +)
+    # handler must still fetch the object and derive the correct email_id
+    print("test setup complete, invoking handler...")
+
+    # Test local handler in isolation first — avoids Lambda-specific layers of complexity while verifying core logic
+    local_handler(event, None, s3, sqs, queue_url)
+    # End of local handler test — now replicate the full Lambda invocation to verify the final S
+
+    # Real Lambda invocation would have the handler read from SQS after processing the S3 event;
+    # replicate that here to verify the final SQS payload
+    handler.handler(event, None)
+
+    response = sqs.receive_message(QueueUrl=queue_url)
+    print("Received SQS message:", response)
+    # SQS returns Body as a raw JSON string, not a dict — must deserialize
+    payload = json.loads(response["Messages"][0]["Body"])
+    assert payload["email_id"] == "test msg 003"
+    mock.stop()
 
 
+# %%
 # ── test 4 ────────────────────────────────────────────────────────────────────
-
-
 def test_received_at_from_last_modified():
-    with mock_aws():
-        s3, sqs, queue_url, handler = _setup()
-        # payload["received_at"] == s3.get_object()["LastModified"].isoformat()
-        pass
+    mock = mock_aws()
+    mock.start()
+    s3, sqs, queue_url, handler = _setup()
+    s3.put_object(
+        Bucket=BUCKET,
+        Key="raw-emails/test-msg-004",
+        Body=build_eml().as_bytes(),
+    )
+    event = {
+        "Records": [
+            {
+                "s3": {
+                    "bucket": {"name": BUCKET},
+                    "object": {"key": "raw-emails/test-msg-004"},
+                }
+            }
+        ]
+    }
+    # handler should populate payload["received_at"] with the S3 object's LastModified timestamp in ISO 8601 format
+    local_handler(event, None, s3, sqs, queue_url)
+    # Real Lambda invocation would have the handler read from SQS after processing the S3 event;
+    # The handler should populate payload["received_at"] with the S3 object's LastModified timestamp in ISO 8601 format
+    handler.handler(event, None)
+    response = sqs.receive_message(QueueUrl=queue_url)
+    payload = json.loads(response["Messages"][0]["Body"])
+    print("Received SQS message with payload:", payload)
+    assert (
+        payload["received_at"]
+        == s3.get_object(Bucket=BUCKET, Key="raw-emails/test-msg-004")[
+            "LastModified"
+        ].isoformat()
+    )
+    mock.stop()
 
 
+# %%
 # ── test 5 ────────────────────────────────────────────────────────────────────
 
 
 def test_poison_pill_omits_body_key():
-    with mock_aws():
-        s3, sqs, queue_url, handler = _setup()
-        # Subject contains POISON_PILL_MARKER -> "body" key is absent from SQS payload
-        pass
+    mock = mock_aws()
+    mock.start()
+    s3, sqs, queue_url, handler = _setup()
+    # Subject contains POISON_PILL_MARKER -> "body" key is absent from SQS payload
+    pass
+    mock.stop()
 
+
+# %%
 
 # ── test 6 ────────────────────────────────────────────────────────────────────
 
 
 def test_multipart_email_body_extracted():
-    with mock_aws():
-        s3, sqs, queue_url, handler = _setup()
-        # Upload a multipart/alternative .eml -> payload["body"] matches parse_email output
-        pass
+    mock = mock_aws()
+    mock.start()
+    s3, sqs, queue_url, handler = _setup()
+    # Upload a multipart/alternative .eml -> payload["body"] matches parse_email output
+    pass
+    mock.stop()
 
 
 # ── test 7 ────────────────────────────────────────────────────────────────────
 
 
 def test_sqs_message_json_serializable():
-    with mock_aws():
-        s3, sqs, queue_url, handler = _setup()
-        # SQS MessageBody round-trips through json.loads() without error
-        pass
+    mock = mock_aws()
+    mock.start()
+    s3, sqs, queue_url, handler = _setup()
+    # SQS MessageBody round-trips through json.loads() without error
+    pass
 
 
 # ── test 8 ────────────────────────────────────────────────────────────────────
 
 
 def test_xray_annotation_called_with_email_id():
-    with mock_aws():
-        s3, sqs, queue_url, handler = _setup()
-        # patch xray_recorder.put_annotation, invoke handler
-        # assert it was called with ("email_id", "<msgid>")
-        pass
+    mock = mock_aws()
+    mock.start()
+    s3, sqs, queue_url, handler = _setup()
+    # patch xray_recorder.put_annotation, invoke handler
+    # assert it was called with ("email_id", "<msgid>")
+    pass
+
+
+# %%
