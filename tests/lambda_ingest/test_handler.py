@@ -274,14 +274,40 @@ def test_received_at_from_last_modified():
 
 # %%
 # ── test 5 ────────────────────────────────────────────────────────────────────
-
-
 def test_poison_pill_omits_body_key():
     mock = mock_aws()
     mock.start()
     s3, sqs, queue_url, handler = _setup()
+    s3.put_object(
+        Bucket=BUCKET,
+        Key="raw-emails/test-msg-005",
+        Body=build_eml(subject="This email contains ECHO-POISON-PILL").as_bytes(),
+    )
+    event = {
+        "Records": [
+            {
+                "s3": {
+                    "bucket": {"name": BUCKET},
+                    "object": {"key": "raw-emails/test-msg-005"},
+                }
+            }
+        ]
+    }
+    # local test
+    local_handler(event, None, s3, sqs, queue_url)
+
+    # Real Lambda invocation would have the handler read from SQS after processing the S3 event;
+    handler.handler(event, None)
+    response = sqs.receive_message(QueueUrl=queue_url)
+    payload = json.loads(response["Messages"][0]["Body"])
+    print("Received SQS message with payload:", payload)
+
+    assert payload["email_id"] == "test-msg-005"
+    assert payload["subject"] == "This email contains ECHO-POISON-PILL"
+    assert (
+        "body" not in payload
+    )  # poison pill marker in subject should trigger body omission
     # Subject contains POISON_PILL_MARKER -> "body" key is absent from SQS payload
-    pass
     mock.stop()
 
 
@@ -294,7 +320,6 @@ def test_multipart_email_body_extracted():
     mock = mock_aws()
     mock.start()
     s3, sqs, queue_url, handler = _setup()
-    # Upload a multipart/alternative .eml -> payload["body"] matches parse_email output
     pass
     mock.stop()
 
