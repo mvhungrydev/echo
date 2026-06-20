@@ -17,26 +17,25 @@ from keyword_rules import apply_keyword_override
 
 def test_keyword_match_overrides_urgency_to_high():
     # text contains "outage" + urgency="medium" -> urgency="high", override_applied=True
-    urgency = apply_keyword_override("outage", "medium")
-    assert urgency["urgency"] == "high" and urgency["urgency_override_applied"] == True
+    result = apply_keyword_override("outage", "medium")
+    assert result["urgency"] == "high" and result["urgency_override_applied"] == True
 
 
 # %%
 # ── test 2 ────────────────────────────────────────────────────────────────────
-
-
 def test_multi_word_phrase_matches():
     # text contains "charged twice" -> override applied
-    pass
+    result = apply_keyword_override("I was charged twice for my subscription.", "low")
+    assert result["urgency"] == "high"
+    assert result["urgency_override_applied"] == True
 
 
 # %%
 # ── test 3 ────────────────────────────────────────────────────────────────────
-
-
 def test_escalation_churn_keyword_matches():
     # text contains "cancel my account" -> override applied
-    pass
+    result = apply_keyword_override("cancel my account", "notreal")
+    assert result["urgency"] == "high" and result["urgency_override_applied"] == True
 
 
 # %%
@@ -45,6 +44,9 @@ def test_escalation_churn_keyword_matches():
 
 def test_keyword_match_is_case_insensitive():
     # text contains "DATA BREACH" (mixed case) -> override applied
+    result = apply_keyword_override("We have a DATA BREACH situation.", "low")
+    assert result["urgency"] == "high"
+    assert result["urgency_override_applied"] == True
     pass
 
 
@@ -54,7 +56,9 @@ def test_keyword_match_is_case_insensitive():
 
 def test_no_keyword_match_returns_original_urgency():
     # text contains none of the keywords, urgency="low" -> urgency="low", override_applied=False
-    pass
+    result = apply_keyword_override("Everything is working fine, thank you.", "low")
+    assert result["urgency"] == "low"
+    assert result["urgency_override_applied"] == False
 
 
 # %%
@@ -63,7 +67,9 @@ def test_no_keyword_match_returns_original_urgency():
 
 def test_already_high_urgency_without_keyword_not_flagged():
     # urgency="high" already (no keyword match) -> stays "high", override_applied=False
-    pass
+    result = apply_keyword_override("Everything looks good.", "high")
+    assert result["urgency"] == "high"
+    assert result["urgency_override_applied"] == False
 
 
 # %%
@@ -72,4 +78,6 @@ def test_already_high_urgency_without_keyword_not_flagged():
 
 def test_keyword_matches_as_substring():
     # text contains "shutdown" -> still matches "down", override applied
-    pass
+    result = apply_keyword_override("The server shutdown unexpectedly.", "low")
+    assert result["urgency"] == "high"
+    assert result["urgency_override_applied"] == True
