@@ -2,11 +2,11 @@
 import json
 import os
 import sys
-from unittest.mock import patch
 import boto3
 from email.message import EmailMessage
 from moto import mock_aws
 from urllib.parse import unquote_plus
+from unittest.mock import patch, MagicMock
 
 BUCKET = "echo-raw-emails"
 # absolute path so the insert works regardless of where pytest is invoked from
@@ -69,6 +69,7 @@ def _setup():
 
 def local_handler(event, context, s3, sqs, queue_url):
     from mime_parser import parse_email
+    from aws_xray_sdk.core import xray_recorder
 
     print("recieved event:", event)
     # lamanda code starts here
@@ -89,6 +90,8 @@ def local_handler(event, context, s3, sqs, queue_url):
     # rsplit on the last "/" only — handles keys with multiple path segments safely
     email_id = key.rsplit("/", 1)[-1]
     print(email_id)
+
+    xray_recorder.put_annotation("email_id", email_id)
 
     parsed_email = parse_email(raw_bytes)
     print(parsed_email)
@@ -390,16 +393,46 @@ def test_sqs_message_json_serializable():
     mock.stop()
 
 
+# %%
 # ── test 8 ────────────────────────────────────────────────────────────────────
-
-
 def test_xray_annotation_called_with_email_id():
     mock = mock_aws()
     mock.start()
     s3, sqs, queue_url, handler = _setup()
-    # patch xray_recorder.put_annotation, invoke handler
-    # assert it was called with ("email_id", "<msgid>")
-    pass
+
+    s3.put_object(
+        Bucket=BUCKET,
+        Key="raw-emails/test-msg-008",
+        Body=build_eml(
+            html_body="<p>This is the HTML part of the email.</p>"
+        ).as_bytes(),
+    )
+
+    # patch the method on the singleton object — affects all references including local_handler's
+    # import; patching "handler.xray_recorder" would only intercept handler.py's namespace
+    # put_annotation() requires an active X-Ray segment — the Lambda runtime
+    # provides one in production but not in tests. Patching replaces it with a
+    # MagicMock that accepts calls without a segment and records them for assertion.
+    with patch(
+        "aws_xray_sdk.core.xray_recorder.put_annotation", new_callable=MagicMock
+    ) as mock_put_annotation:
+        event = {
+            "Records": [
+                {
+                    "s3": {
+                        "bucket": {"name": BUCKET},
+                        "object": {"key": "raw-emails/test-msg-008"},
+                    }
+                }
+            ]
+        }
+        local_handler(event, None, s3, sqs, queue_url)
+
+        handler.handler(event, None)
+        # assert_called_with checks the LAST call — sufficient here since only one annotation is made
+        mock_put_annotation.assert_called_with("email_id", "test-msg-008")
+
+    mock.stop()
 
 
 # %%
