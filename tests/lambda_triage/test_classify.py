@@ -22,116 +22,11 @@ sys.path.insert(
 )
 
 # import as module so classify.bedrock is accessible for patch.object
-# import classify
-
-# %%
-
-import boto3
-from retry_config import BEDROCK_CONFIG
-
-bedrock = boto3.client("bedrock-runtime", config=BEDROCK_CONFIG)
-
-# pinned model ARN — never float to "latest" so a model swap can't silently change output schema
-MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
-
-# enum sets used by _validate — any value outside these triggers a retry
-VALID_CATEGORIES = {
-    "bug_report",
-    "feature_request",
-    "general_inquiry",
-    "billing",
-    "complaint",
-    "praise",
-}
-VALID_URGENCY = {"high", "medium", "low"}
-VALID_SENTIMENT = {"positive", "negative", "constructive"}
-VALID_CONFIDENCE = {"high", "medium", "low"}
-
-# feature_tags is excluded — it's defaulted to [] in _try_parse, not validated here
-REQUIRED_FIELDS = {"category", "urgency", "sentiment", "confidence", "suggested_reply"}
-
-# instructs the model to return ONLY a JSON object with the 6 fields and their valid values
-SYSTEM_PROMPT = ""  # TODO: pmc
-
-# appended to SYSTEM_PROMPT on retry — tells the model its previous response was invalid
-RETRY_SYSTEM_PROMPT = ""  # TODO: pmc
-
-# FR17 fallback — returned when both invoke attempts fail to produce valid JSON
-DEGRADED_RESULT = {
-    "category": "unclassified",
-    "urgency": "medium",
-    "sentiment": "unknown",
-    "confidence": "low",
-    "suggested_reply": None,
-    "feature_tags": [],
-}
-
-
-# %%
-def _invoke(body_text: str, system_prompt: str, max_tokens: int) -> str:
-    # call Bedrock with the Anthropic Messages format; return the raw text string
-    # from the model's response (first JSON decode happens here — unwraps Bedrock envelope)
-    response = bedrock.invoke_model(
-        modelId=MODEL_ID,
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps(
-            {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": max_tokens,
-                "temperature": 0.0,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": body_text}],
-            }
-        ),
-    )
-    result = json.loads(response["body"].read())["content"][0]["text"]
-    print(result)
-    return result
-
-
-def _validate(parsed: dict) -> bool:
-    # check all REQUIRED_FIELDS are present AND each enum field is within its VALID_* set
-    return (
-        REQUIRED_FIELDS.issubset(parsed.keys())
-        and parsed["category"] in VALID_CATEGORIES
-        and parsed["urgency"] in VALID_URGENCY
-        and parsed["sentiment"] in VALID_SENTIMENT
-        and parsed["confidence"] in VALID_CONFIDENCE
-    )
-
-
-def _try_parse(raw_text: str) -> dict | None:
-    # second JSON decode — if it fails or _validate fails, return None
-    # on success: setdefault feature_tags=[] so the field always exists for persist.py
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        return None
-
-    if not _validate(parsed):
-        return None
-    parsed.setdefault("feature_tags", [])
-    return parsed
-
-
-def local_classify(body_text: str) -> dict:
-    # attempt 1 -> attempt 2 (corrective prompt + larger max_tokens) -> DEGRADED_RESULT
-    # always returns classification_failed bool so handler can emit ClassificationFailure metric
-    parse_result = _try_parse(_invoke(body_text, SYSTEM_PROMPT, max_tokens=512))
-    if parse_result is not None:
-        return {**parse_result, "classification_failed": False}
-    parse_result = _try_parse(_invoke(body_text, RETRY_SYSTEM_PROMPT, max_tokens=768))
-    if parse_result is not None:
-        return {**parse_result, "classification_failed": False}
-    return {**DEGRADED_RESULT, "classification_failed": True}
+import classify
 
 
 def mock_bedrock_response(text: str) -> dict:
-    # simulates Bedrock's StreamingBody — io.BytesIO has .read(), no botocore needed
-    # wraps text in the Bedrock envelope: {"content": [{"type": "text", "text": "..."}]}
     envelope = json.dumps({"content": [{"type": "text", "text": text}]}).encode()
-    print({"body": io.BytesIO(envelope)})
     return {"body": io.BytesIO(envelope)}
 
 
@@ -150,9 +45,9 @@ def test_valid_response_on_first_attempt():
     }
     mock_response = mock_bedrock_response(json.dumps(valid))
     with patch.object(
-        bedrock, "invoke_model", return_value=mock_response
+        classify.bedrock, "invoke_model", return_value=mock_response
     ) as mock_invoke:
-        result = local_classify("My app keeps crashing on login.")
+        result = classify.classify("My app keeps crashing on login.")
     assert result["classification_failed"] is False
     assert result["category"] == "bug_report"
     assert result["urgency"] == "high"
@@ -164,7 +59,6 @@ def test_valid_response_on_first_attempt():
 
 
 # %%
-
 # ── test 2 ────────────────────────────────────────────────────────────────────
 
 
@@ -180,19 +74,19 @@ def test_invalid_then_valid_triggers_retry():
     bad_response = mock_bedrock_response("not valid json at all")
     good_response = mock_bedrock_response(json.dumps(valid))
     with patch.object(
-        bedrock, "invoke_model", side_effect=[bad_response, good_response]
+        classify.bedrock, "invoke_model", side_effect=[bad_response, good_response]
     ) as mock_invoke:
-        result = local_classify("It would be great if you added dark mode.")
+        result = classify.classify("It would be great if you added dark mode.")
     assert result["classification_failed"] is False
     assert result["category"] == "feature_request"
     assert mock_invoke.call_count == 2
     # verify attempt 1 used SYSTEM_PROMPT + max_tokens=512
     attempt1_body = json.loads(mock_invoke.call_args_list[0].kwargs["body"])
-    assert attempt1_body["system"] == SYSTEM_PROMPT
+    assert attempt1_body["system"] == classify.SYSTEM_PROMPT
     assert attempt1_body["max_tokens"] == 512
     # verify attempt 2 used RETRY_SYSTEM_PROMPT + max_tokens=768
     attempt2_body = json.loads(mock_invoke.call_args_list[1].kwargs["body"])
-    assert attempt2_body["system"] == RETRY_SYSTEM_PROMPT
+    assert attempt2_body["system"] == classify.RETRY_SYSTEM_PROMPT
     assert attempt2_body["max_tokens"] == 768
 
 
@@ -205,9 +99,9 @@ def test_both_attempts_fail_returns_degraded():
     bad_response_1 = mock_bedrock_response("not json")
     bad_response_2 = mock_bedrock_response("also not json")
     with patch.object(
-        bedrock, "invoke_model", side_effect=[bad_response_1, bad_response_2]
+        classify.bedrock, "invoke_model", side_effect=[bad_response_1, bad_response_2]
     ) as mock_invoke:
-        result = local_classify("Some email body.")
+        result = classify.classify("Some email body.")
     assert result["classification_failed"] is True
     assert result["category"] == "unclassified"
     assert result["urgency"] == "medium"
@@ -240,9 +134,9 @@ def test_missing_required_key_triggers_retry():
     bad_response = mock_bedrock_response(json.dumps(missing_key))
     good_response = mock_bedrock_response(json.dumps(valid))
     with patch.object(
-        bedrock, "invoke_model", side_effect=[bad_response, good_response]
+        classify.bedrock, "invoke_model", side_effect=[bad_response, good_response]
     ) as mock_invoke:
-        result = local_classify("App crashes every time.")
+        result = classify.classify("App crashes every time.")
     assert result["classification_failed"] is False
     assert result["confidence"] == "medium"
     assert mock_invoke.call_count == 2
@@ -270,9 +164,9 @@ def test_invalid_enum_value_triggers_retry():
     bad_response = mock_bedrock_response(json.dumps(bad_enum))
     good_response = mock_bedrock_response(json.dumps(valid))
     with patch.object(
-        bedrock, "invoke_model", side_effect=[bad_response, good_response]
+        classify.bedrock, "invoke_model", side_effect=[bad_response, good_response]
     ) as mock_invoke:
-        result = local_classify("This is really urgent!")
+        result = classify.classify("This is really urgent!")
     assert result["classification_failed"] is False
     assert result["urgency"] == "high"
     assert mock_invoke.call_count == 2
@@ -291,8 +185,8 @@ def test_missing_feature_tags_defaults_to_empty_list():
         "suggested_reply": "Happy to help!",
     }
     mock_response = mock_bedrock_response(json.dumps(no_tags))
-    with patch.object(bedrock, "invoke_model", return_value=mock_response):
-        result = local_classify("Just a quick question about your hours.")
+    with patch.object(classify.bedrock, "invoke_model", return_value=mock_response):
+        result = classify.classify("Just a quick question about your hours.")
     assert result["feature_tags"] == []
     assert result["classification_failed"] is False
 
@@ -328,9 +222,9 @@ def test_response_body_read_only_once_per_invoke():
     bad_response = mock_bedrock_response("not json")
     good_response = make_read_once_response()
     with patch.object(
-        bedrock, "invoke_model", side_effect=[bad_response, good_response]
+        classify.bedrock, "invoke_model", side_effect=[bad_response, good_response]
     ):
-        result = local_classify("I was charged twice this month.")
+        result = classify.classify("I was charged twice this month.")
     assert result["classification_failed"] is False
     assert result["category"] == "billing"
 
