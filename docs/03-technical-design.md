@@ -754,6 +754,7 @@ Attributes (all non-key attributes are schemaless under DynamoDB's model — lis
 | `review_status` | S | Lambda #2 | `auto_processed` \| `needs_review` |
 | `suggested_reply` | S or NULL | Lambda #2 | |
 | `feature_tags` | L (list of S) | Lambda #2 | only populated when `category=feature_request` (FR6) |
+| `redacted_body` | S | Lambda #2 | email body after PII redaction; `NAME`/`EMAIL`/`PHONE` not redacted (see `PII_TYPES_TO_SKIP`) |
 | `pii_entities_detected` | N | Lambda #2 | count from §8.8 |
 | `processed_at` | S (ISO 8601) | Lambda #2 | |
 | `ttl` | N | Lambda #2 | see above |

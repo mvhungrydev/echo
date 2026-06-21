@@ -293,6 +293,7 @@ For reference when implementing Lambda #2 (writer) and Lambda #3 (reader) — re
 | `review_status`            | S         | Lambda #2  | `auto_processed` \| `needs_review`             |
 | `suggested_reply`          | S \| NULL | Lambda #2  | `NULL` on FR17 degraded record                 |
 | `feature_tags`             | L of S    | Lambda #2  | populated only when `category=feature_request` |
+| `redacted_body`            | S         | Lambda #2  | email body after PII redaction; `NAME`/`EMAIL`/`PHONE` not redacted (see `PII_TYPES_TO_SKIP`) |
 | `pii_entities_detected`    | N         | Lambda #2  | Comprehend redaction count                     |
 | `processed_at`             | S         | Lambda #2  | ISO 8601                                       |
 | `ttl`                      | N         | Lambda #2  | epoch seconds, `received_at + 90d`             |
