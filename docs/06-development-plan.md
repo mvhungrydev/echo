@@ -287,6 +287,27 @@ def parse_email(raw_bytes: bytes) -> dict:
 - [email.message.EmailMessage](https://docs.python.org/3/library/email.message.html#email.message.EmailMessage)
 - [Content-Transfer-Encoding (RFC 2045)](https://datatracker.ietf.org/doc/html/rfc2045#section-6)
 
+**Input/Output Shapes:**
+
+```python
+# INPUT — raw_bytes: what a .eml file looks like as bytes:
+raw_bytes = b'From: Jane Doe <jane@example.com>\r\nSubject: Help needed\r\nContent-Type: text/plain\r\n\r\nI need help with my account.'
+
+# OUTPUT — parse_email() always returns exactly these 3 keys, always strings:
+{
+    "from_address": "jane@example.com",   # just the email, no display name
+    "subject": "Help needed",              # RFC 2047 decoded if encoded
+    "body": "I need help with my account." # base64/QP decoded, plain preferred over html
+}
+
+# EDGE CASE — attachment-only email (no body part):
+{
+    "from_address": "sender@example.com",
+    "subject": "See attached",
+    "body": ""  # empty string, never None
+}
+```
+
 **Sample Code — building a test fixture:**
 
 ```python
@@ -410,16 +431,47 @@ def handler(event, context):
 - [importlib.reload](https://docs.python.org/3/library/importlib.html#importlib.reload)
 - [urllib.parse.unquote_plus](https://docs.python.org/3/library/urllib.parse.html#urllib.parse.unquote_plus)
 
-**Sample Code — S3 event shape (what `event` looks like):**
+**Input/Output Shapes:**
 
 ```python
+# INPUT — event (S3 notification, only the keys handler uses):
 event = {
     "Records": [{
         "s3": {
             "bucket": {"name": "echo-raw-emails-dev"},
-            "object": {"key": "raw-emails/abc123def456"}
+            "object": {"key": "raw-emails/abc123def456"}  # URL-encoded by S3
         }
     }]
+}
+
+# INPUT — context: Lambda context object (unused by this handler, pass None in tests)
+
+# INTERMEDIATE — s3.get_object() response shape:
+response = {
+    "Body": StreamingBody(...),         # .read() → raw .eml bytes
+    "LastModified": datetime(2026, 6, 21, 14, 30, 0, tzinfo=timezone.utc),  # boto3-parsed
+    "ContentType": "application/octet-stream",
+    # ... other metadata we don't use
+}
+
+# OUTPUT — SQS message payload (json.dumps'd into MessageBody):
+{
+    "email_id": "abc123def456",                    # from S3 key, after last "/"
+    "from_address": "jane@example.com",            # from parse_email()
+    "subject": "Help with my account",             # from parse_email()
+    "body": "I need help with my account...",      # from parse_email()
+    "received_at": "2026-06-21T14:30:00+00:00",   # LastModified.isoformat()
+    "raw_s3_key": "raw-emails/abc123def456"        # decoded key (for audit trail)
+}
+
+# POISON-PILL VARIANT — same but "body" key is DELETED:
+{
+    "email_id": "abc123def456",
+    "from_address": "attacker@example.com",
+    "subject": "ECHO-POISON-PILL test",
+    "received_at": "2026-06-21T14:30:00+00:00",
+    "raw_s3_key": "raw-emails/abc123def456"
+    # NO "body" key — causes KeyError in Lambda #2
 }
 ```
 
@@ -546,6 +598,22 @@ def apply_keyword_override(text: str, urgency: str) -> dict:
 - [Python `str.lower()`](https://docs.python.org/3/library/stdtypes.html#str.lower)
 - [Python `in` operator for substring matching](https://docs.python.org/3/reference/expressions.html#membership-test-operations)
 
+**Input/Output Shapes:**
+
+```python
+# INPUT — text: the concatenated subject + redacted body (built in handler 4.5 step 5):
+text = "Help with billing I was charged twice for my subscription on [DATE]"
+#       ^ subject           ^ " " + pii_result["redacted_text"]
+
+# INPUT — urgency: the model's urgency from classify.py (before keyword override):
+urgency = "medium"  # one of: "high", "medium", "low"
+
+# OUTPUT — always exactly these 2 keys:
+{"urgency": "high", "urgency_override_applied": True}   # keyword found
+{"urgency": "medium", "urgency_override_applied": False} # no keyword found
+{"urgency": "high", "urgency_override_applied": False}   # already high, no keyword
+```
+
 **Sample Code — implementation pattern:**
 
 ```python
@@ -656,6 +724,34 @@ def redact_pii(text: str) -> dict:
 - [boto3 Comprehend client](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/comprehend.html)
 - [unittest.mock.patch.object](https://docs.python.org/3/library/unittest.mock.html#unittest.mock.patch.object)
 - [unittest.mock — quick guide](https://docs.python.org/3/library/unittest.mock-examples.html)
+
+**Input/Output Shapes:**
+
+```python
+# INPUT — text: the raw email body from Lambda #1's payload (before redaction):
+text = "Hi, my name is John Doe. Call me at 555-123-4567. I live at 123 Main St."
+
+# INTERMEDIATE — what Comprehend returns (the API response):
+{
+    "Entities": [
+        {"Score": 0.9987, "Type": "NAME", "BeginOffset": 15, "EndOffset": 23},
+        {"Score": 0.9500, "Type": "PHONE", "BeginOffset": 35, "EndOffset": 47},
+        {"Score": 0.3000, "Type": "ADDRESS", "BeginOffset": 59, "EndOffset": 70},  # below 0.5 threshold
+    ]
+}
+
+# OUTPUT — redact_pii() always returns exactly these 2 keys:
+{
+    "redacted_text": "Hi, my name is [NAME]. Call me at [PHONE]. I live at 123 Main St.",
+    "pii_entities_detected": 2  # only entities >= 0.5 threshold count
+}
+
+# OUTPUT — when no PII found:
+{
+    "redacted_text": "Thanks for the quick reply!",  # unchanged
+    "pii_entities_detected": 0
+}
+```
 
 **Sample Code — Comprehend API response shape:**
 
@@ -794,6 +890,49 @@ def classify(body_text: str) -> dict: ...
 - [StreamingBody (botocore)](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/response.html#botocore.response.StreamingBody)
 - [json.JSONDecodeError](https://docs.python.org/3/library/json.html#json.JSONDecodeError)
 - [io.BytesIO](https://docs.python.org/3/library/io.html#io.BytesIO)
+
+**Input/Output Shapes:**
+
+```python
+# INPUT — body_text: the PII-redacted email body from pii.redact_pii():
+body_text = "Hi, my name is [NAME]. I was charged twice for my subscription on [DATE]."
+
+# OUTPUT — classify() on SUCCESS (valid model response):
+{
+    "category": "billing",                      # one of VALID_CATEGORIES
+    "urgency": "high",                          # one of: high, medium, low
+    "sentiment": "negative",                    # one of: positive, negative, constructive
+    "confidence": "high",                       # one of: high, medium, low
+    "suggested_reply": "We'll investigate the duplicate charge and issue a refund.",
+    "feature_tags": [],                         # always present (setdefault)
+    "classification_failed": False              # added by classify(), not the model
+}
+
+# OUTPUT — classify() on FAILURE (both attempts failed → FR17 degraded):
+{
+    "category": "unclassified",
+    "urgency": "medium",
+    "sentiment": "unknown",
+    "confidence": "low",
+    "suggested_reply": None,
+    "feature_tags": [],
+    "classification_failed": True               # handler uses this for DR7 metric
+}
+
+# OUTPUT — classify() for a feature_request:
+{
+    "category": "feature_request",
+    "urgency": "low",
+    "sentiment": "constructive",
+    "confidence": "high",
+    "suggested_reply": "Thank you for the suggestion! We'll add it to our backlog.",
+    "feature_tags": ["dark-mode", "mobile-app"],  # only meaningful for feature_request
+    "classification_failed": False
+}
+
+# INTERNAL — what the MODEL returns (the raw text inside Bedrock envelope):
+'{"category":"billing","urgency":"high","sentiment":"negative","confidence":"high","suggested_reply":"We\'ll investigate...","feature_tags":[]}'
+```
 
 **Sample Code — Bedrock invoke_model request + response:**
 
@@ -1009,6 +1148,43 @@ def put_triage_record(record: dict) -> None: ...
 - [datetime.fromisoformat](https://docs.python.org/3/library/datetime.html#datetime.datetime.fromisoformat)
 - [moto DynamoDB support](https://docs.getmoto.org/en/latest/docs/services/dynamodb.html)
 
+**Input/Output Shapes:**
+
+```python
+# INPUT to get_existing_record — just the email_id string:
+email_id = "abc123def456"  # the SES messageId from Lambda #1
+
+# OUTPUT of get_existing_record — None if not found, full item dict if found:
+None                         # not found → handler proceeds with processing
+{"email_id": "abc123def456", "category": "billing", ...}  # found → handler short-circuits
+
+# INPUT to put_triage_record — the full 15-field record dict from handler step 7:
+record = {
+    "email_id": "abc123def456",
+    "received_at": "2026-06-21T14:30:00+00:00",
+    "from_address": "jane@example.com",
+    "subject": "Charged twice",
+    "raw_s3_key": "raw-emails/abc123def456",
+    "category": "billing",
+    "urgency": "high",
+    "sentiment": "negative",
+    "confidence": "high",
+    "suggested_reply": "We'll investigate the duplicate charge.",
+    "feature_tags": [],
+    "urgency_override_applied": True,
+    "review_status": "auto_processed",
+    "pii_entities_detected": 2,
+    "redacted_body": "Hi, my name is [NAME]. I was charged twice..."
+}
+
+# WHAT GETS WRITTEN TO DYNAMODB (put_triage_record adds 2 fields):
+{
+    **record,                                                    # all 15 fields above
+    "processed_at": "2026-06-21T14:30:05+00:00",               # computed at write time
+    "ttl": 1758466200                                            # epoch + 90 days
+}
+```
+
 **Sample Code — get_item response shapes:**
 
 ```python
@@ -1145,9 +1321,10 @@ def handler(event, context):
 - [SQS Lambda event format](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html#example-standard-queue-message-event)
 - [Python importlib.reload](https://docs.python.org/3/library/importlib.html#importlib.reload)
 
-**Sample Code — SQS event shape (what `event` looks like):**
+**Input/Output Shapes:**
 
 ```python
+# INPUT — event (SQS trigger, batch_size=1):
 event = {
     "Records": [{
         "body": '{"email_id":"msg-001","from_address":"jane@example.com","subject":"Help","body":"I need help with...","received_at":"2026-06-21T10:00:00+00:00","raw_s3_key":"raw-emails/msg-001"}'
@@ -1155,6 +1332,51 @@ event = {
 }
 # Note: body is a JSON STRING, not a dict — must json.loads() it
 message = json.loads(event["Records"][0]["body"])
+
+# INTERMEDIATE — message (after json.loads, these are the 6 keys from Lambda #1):
+message = {
+    "email_id": "msg-001",
+    "from_address": "jane@example.com",
+    "subject": "Help with billing",
+    "body": "Hi, my name is John Doe. I was charged twice for my subscription.",
+    "received_at": "2026-06-21T10:00:00+00:00",
+    "raw_s3_key": "raw-emails/msg-001"
+}
+
+# INTERMEDIATE — pii_result (from pii.redact_pii(message["body"])):
+pii_result = {
+    "redacted_text": "Hi, my name is [NAME]. I was charged twice for my subscription.",
+    "pii_entities_detected": 1
+}
+
+# INTERMEDIATE — classification (from classify.classify(pii_result["redacted_text"])):
+classification = {
+    "category": "billing", "urgency": "medium", "sentiment": "negative",
+    "confidence": "high", "suggested_reply": "We'll investigate...",
+    "feature_tags": [], "classification_failed": False
+}
+
+# INTERMEDIATE — override (from keyword_rules.apply_keyword_override(...)):
+override = {"urgency": "high", "urgency_override_applied": True}
+
+# OUTPUT — the 15-field record dict passed to persist.put_triage_record():
+record = {
+    "email_id": "msg-001",                          # from message
+    "received_at": "2026-06-21T10:00:00+00:00",    # from message
+    "from_address": "jane@example.com",             # from message
+    "subject": "Help with billing",                 # from message
+    "raw_s3_key": "raw-emails/msg-001",             # from message
+    "category": "billing",                          # from classification
+    "sentiment": "negative",                        # from classification
+    "confidence": "high",                           # from classification
+    "suggested_reply": "We'll investigate...",      # from classification
+    "feature_tags": [],                             # from classification
+    "urgency": "high",                              # from override (NOT classification)
+    "urgency_override_applied": True,               # from override
+    "review_status": "auto_processed",              # computed: confidence=high + not failed
+    "pii_entities_detected": 1,                     # from pii_result
+    "redacted_body": "Hi, my name is [NAME]. I was charged twice..."  # pii_result["redacted_text"]
+}
 ```
 
 **Sample Code — double-mocking pattern (moto + patch.object):**
@@ -1298,6 +1520,54 @@ def _emit_emf(record: dict, classification_failed: bool, alert_publish_failed: b
 - [EMF specification (JSON schema)](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html#CloudWatch_Embedded_Metric_Format_Specification_structure)
 - [pytest capsys fixture](https://docs.pytest.org/en/stable/how-to/capture-warnings.html)
 - [moto SNS support](https://docs.getmoto.org/en/latest/docs/services/sns.html)
+
+**Input/Output Shapes:**
+
+```python
+# INPUT — record: the 15-field dict from step 8 (same as persist input):
+record = {
+    "email_id": "msg-001", "received_at": "2026-06-21T10:00:00+00:00",
+    "from_address": "jane@example.com", "subject": "Help with billing",
+    "raw_s3_key": "raw-emails/msg-001", "category": "billing",
+    "urgency": "high", "sentiment": "negative", "confidence": "high",
+    "suggested_reply": "We'll investigate...", "feature_tags": [],
+    "urgency_override_applied": True, "review_status": "auto_processed",
+    "pii_entities_detected": 1, "redacted_body": "Hi, my name is [NAME]..."
+}
+
+# _alert_type(record) → determines which alert path:
+"urgent"       # when record["urgency"] == "high"
+"needs_review" # when record["review_status"] == "needs_review" (and not urgent)
+"none"         # otherwise
+
+# _build_alert_body() — 3 shapes depending on alert_type:
+
+# "urgent" shape (full context for immediate action):
+{
+    "email_id": "msg-001", "alert_type": "urgent",
+    "received_at": "2026-06-21T10:00:00+00:00",
+    "from_address": "jane@example.com", "subject": "Help with billing",
+    "category": "billing", "urgency": "high", "urgency_override_applied": True,
+    "sentiment": "negative", "confidence": "high",
+    "suggested_reply": "We'll investigate..."
+}
+
+# "needs_review" shape (+ review_reason, - urgency_override_applied):
+{
+    "email_id": "msg-002", "alert_type": "needs_review",
+    "received_at": "...", "from_address": "...", "subject": "...",
+    "category": "general_inquiry", "urgency": "low", "sentiment": "constructive",
+    "confidence": "low", "suggested_reply": "...",
+    "review_reason": "low_confidence"  # or "classification_failed"
+}
+
+# "none" shape (minimal — data-minimization):
+{
+    "email_id": "msg-003", "alert_type": "none",
+    "received_at": "...",
+    "category": "praise", "urgency": "low", "sentiment": "positive", "confidence": "high"
+}
+```
 
 **Sample Code — SNS publish with MessageAttributes:**
 
@@ -1466,6 +1736,34 @@ def get_auto_processed_records() -> list[dict]: ...
 - [DynamoDB Scan pagination](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.Pagination)
 - [DynamoDB reserved words](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ReservedWords.html)
 
+**Input/Output Shapes:**
+
+```python
+# INPUT — none (function takes no arguments)
+
+# OUTPUT — list of dicts, each with EXACTLY these 5 projected fields:
+[
+    {
+        "category": "billing",
+        "urgency": "high",
+        "sentiment": "negative",
+        "feature_tags": [],                    # always present, [] for non-feature_request
+        "received_at": "2026-06-21T10:00:00+00:00"
+    },
+    {
+        "category": "feature_request",
+        "urgency": "low",
+        "sentiment": "constructive",
+        "feature_tags": ["dark-mode", "mobile-app"],  # populated for feature_request
+        "received_at": "2026-06-20T09:00:00+00:00"
+    },
+    # ... more items (only review_status="auto_processed" included)
+]
+
+# OUTPUT — empty table or no matching items:
+[]
+```
+
 **Sample Code — Scan with filter + projection + pagination:**
 
 ```python
@@ -1577,6 +1875,39 @@ def synthesize(records: list[dict], question: str) -> dict: ...
 - [Bedrock InvokeModel API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html)
 - [Anthropic Messages format on Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html)
 - [botocore Config reference](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html)
+
+**Input/Output Shapes:**
+
+```python
+# INPUT — records: the list from query.get_auto_processed_records() (5 fields each):
+records = [
+    {"category": "billing", "urgency": "high", "sentiment": "negative",
+     "feature_tags": [], "received_at": "2026-06-21T10:00:00+00:00"},
+    {"category": "feature_request", "urgency": "low", "sentiment": "constructive",
+     "feature_tags": ["dark-mode"], "received_at": "2026-06-20T09:00:00+00:00"},
+]
+
+# INPUT — question: the user's natural-language question:
+question = "What are the most common feature requests this week?"
+
+# OUTPUT — synthesize() on SUCCESS:
+{
+    "answer": "Based on the triage data, the most requested feature is dark-mode support...",
+    "synthesis_failed": False
+}
+
+# OUTPUT — synthesize() on FAILURE (both attempts failed):
+{
+    "answer": None,
+    "synthesis_failed": True  # handler turns this into HTTP 503
+}
+
+# OUTPUT — synthesize() when records is empty:
+{
+    "answer": "No triage data is available yet. Once emails are processed...",
+    "synthesis_failed": False  # still 200, not a failure
+}
+```
 
 **Sample Code — differences from 4.3's classify.py (side-by-side):**
 
@@ -1705,9 +2036,10 @@ def handler(event, context): ...
 - [API Gateway proxy event format](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-proxy-integrations.html#api-gateway-simple-proxy-for-lambda-input-format)
 - [HTTP status codes — 502 vs 503](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status)
 
-**Sample Code — API Gateway proxy event (what `event` looks like):**
+**Input/Output Shapes:**
 
 ```python
+# INPUT — event (API Gateway Lambda proxy format):
 event = {
     "body": '{"question": "What are the most common feature requests?"}',
     "httpMethod": "POST",
@@ -1718,6 +2050,31 @@ event = {
 # IMPORTANT: event["body"] is a STRING, not a dict!
 request_body = json.loads(event["body"])
 question = request_body["question"]
+
+# OUTPUT — 200 response (synthesis succeeded):
+{
+    "statusCode": 200,
+    "body": '{"answer": "The most common feature requests are dark-mode...", "records_considered": 12}',
+    "headers": {"Content-Type": "application/json"}
+}
+# body decoded: {"answer": str, "records_considered": int}
+
+# OUTPUT — 200 response (no data yet, records_considered=0):
+{
+    "statusCode": 200,
+    "body": '{"answer": "No triage data is available yet.", "records_considered": 0}',
+    "headers": {"Content-Type": "application/json"}
+}
+
+# OUTPUT — 503 response (synthesis failed after retries):
+{
+    "statusCode": 503,
+    "body": '{"error": "synthesis_unavailable", "records_considered": 12}',
+    "headers": {"Content-Type": "application/json"}
+}
+
+# OUTPUT — 502 (DynamoDB Scan raises → uncaught → API Gateway generic 502):
+# NOT generated by this handler — it's what API Gateway returns when Lambda raises
 ```
 
 **Sample Code — proxy integration response format:**
