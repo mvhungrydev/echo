@@ -175,6 +175,32 @@ BEDROCK_CONFIG = Config(...)   # retries adaptive/3, connect=3, read=10
 **External Docs:**
 - [botocore Config reference](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html)
 - [Retry behavior (adaptive mode)](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/retries.html)
+- [boto3 client configuration](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/configuration.html)
+
+**Sample Code — what the implementation looks like:**
+
+```python
+from botocore.config import Config
+
+GENERAL_CONFIG = Config(
+    retries={"max_attempts": 3, "mode": "adaptive"},
+    connect_timeout=3,
+    read_timeout=5,
+)
+```
+
+**Sample Code — what a test looks like:**
+
+```python
+from retry_config import GENERAL_CONFIG, BEDROCK_CONFIG
+from botocore.config import Config
+
+def test_general_config_is_config_instance():
+    assert isinstance(GENERAL_CONFIG, Config)
+
+def test_general_config_retries():
+    assert GENERAL_CONFIG.retries == {"max_attempts": 3, "mode": "adaptive"}
+```
 
 <details><summary><b>Background & design decisions</b></summary>
 
@@ -258,6 +284,44 @@ def parse_email(raw_bytes: bytes) -> dict:
 - [email.parser.BytesParser](https://docs.python.org/3/library/email.parser.html#email.parser.BytesParser)
 - [email.utils.parseaddr](https://docs.python.org/3/library/email.utils.html#email.utils.parseaddr)
 - [email.policy](https://docs.python.org/3/library/email.policy.html)
+- [email.message.EmailMessage](https://docs.python.org/3/library/email.message.html#email.message.EmailMessage)
+- [Content-Transfer-Encoding (RFC 2045)](https://datatracker.ietf.org/doc/html/rfc2045#section-6)
+
+**Sample Code — building a test fixture:**
+
+```python
+from email.message import EmailMessage
+
+def build_eml(from_addr="jane@example.com", subject="Test", body="Hello"):
+    msg = EmailMessage()
+    msg["From"] = f"Jane Doe <{from_addr}>"
+    msg["Subject"] = subject
+    msg.set_content(body)
+    return msg.as_bytes()
+
+# Multipart alternative (plain + html):
+def build_multipart_eml():
+    msg = EmailMessage()
+    msg["From"] = "test@example.com"
+    msg["Subject"] = "Multi"
+    msg.set_content("Plain text body")
+    msg.add_alternative("<p>HTML body</p>", subtype="html")
+    return msg.as_bytes()
+```
+
+**Sample Code — parsing:**
+
+```python
+from email import policy
+from email.parser import BytesParser
+from email.utils import parseaddr
+
+msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+from_address = parseaddr(str(msg["from"]))[1]  # "jane@example.com"
+subject = str(msg["subject"])
+part = msg.get_body(preferencelist=("plain", "html"))
+body = part.get_content() if part else ""
+```
 
 <details><summary><b>Background & design decisions</b></summary>
 
@@ -341,7 +405,56 @@ def handler(event, context):
 - [S3 GetObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html)
 - [SQS SendMessage](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_SendMessage.html)
 - [moto — supported services](https://docs.getmoto.org/en/latest/docs/services/index.html)
+- [moto `mock_aws` decorator](https://docs.getmoto.org/en/latest/docs/getting_started.html)
 - [aws-xray-sdk Python](https://docs.aws.amazon.com/xray/latest/devguide/xray-sdk-python.html)
+- [importlib.reload](https://docs.python.org/3/library/importlib.html#importlib.reload)
+- [urllib.parse.unquote_plus](https://docs.python.org/3/library/urllib.parse.html#urllib.parse.unquote_plus)
+
+**Sample Code — S3 event shape (what `event` looks like):**
+
+```python
+event = {
+    "Records": [{
+        "s3": {
+            "bucket": {"name": "echo-raw-emails-dev"},
+            "object": {"key": "raw-emails/abc123def456"}
+        }
+    }]
+}
+```
+
+**Sample Code — test fixture with moto + importlib.reload:**
+
+```python
+import importlib
+import os
+import boto3
+from moto import mock_aws
+
+@mock_aws
+def test_happy_path():
+    # 1. Set env vars BEFORE reload
+    os.environ["TRIAGE_QUEUE_URL"] = "https://sqs.us-east-1.amazonaws.com/123/queue"
+
+    # 2. Create AWS resources under mock
+    s3 = boto3.client("s3", region_name="us-east-1")
+    s3.create_bucket(Bucket="echo-raw-emails-dev")
+    sqs = boto3.client("sqs", region_name="us-east-1")
+    queue = sqs.create_queue(QueueName="queue")
+
+    # 3. Reload handler so its module-level clients bind to moto
+    import handler
+    importlib.reload(handler)
+
+    # 4. Put a test .eml in S3
+    s3.put_object(Bucket="echo-raw-emails-dev", Key="raw-emails/msg-001", Body=eml_bytes)
+
+    # 5. Invoke and assert
+    handler.handler(event, None)
+    messages = sqs.receive_message(QueueUrl=queue["QueueUrl"])
+    payload = json.loads(messages["Messages"][0]["Body"])
+    assert payload["email_id"] == "msg-001"
+```
 
 > **Context digest:** S3 event keys are URL-encoded (must `unquote_plus`). `response["Body"]` is a StreamingBody (single `.read()`). `LastModified` is already a `datetime` from boto3. No try/except — RAISE on failure (doc03 §4.5).
 
@@ -429,7 +542,38 @@ def apply_keyword_override(text: str, urgency: str) -> dict:
 6. test #7 (substring boundary — "shutdown" matches "down") → confirms design choice
 
 **External Docs:**
-- No external AWS docs needed — pure Python string matching
+- [Python `any()` built-in](https://docs.python.org/3/library/functions.html#any)
+- [Python `str.lower()`](https://docs.python.org/3/library/stdtypes.html#str.lower)
+- [Python `in` operator for substring matching](https://docs.python.org/3/reference/expressions.html#membership-test-operations)
+
+**Sample Code — implementation pattern:**
+
+```python
+ESCALATION_KEYWORDS = [
+    "down", "outage", "can't access", "locked out",
+    "charged twice", "double charged", "unauthorized charge",
+    "cancel my account", "legal action", "data breach",
+]
+
+def apply_keyword_override(text: str, urgency: str) -> dict:
+    text_lower = text.lower()
+    override_applied = any(kw in text_lower for kw in ESCALATION_KEYWORDS)
+    if override_applied:
+        return {"urgency": "high", "urgency_override_applied": True}
+    return {"urgency": urgency, "urgency_override_applied": False}
+```
+
+**Sample Code — test pattern:**
+
+```python
+def test_outage_triggers_override():
+    result = apply_keyword_override("System is down since 3pm", urgency="medium")
+    assert result == {"urgency": "high", "urgency_override_applied": True}
+
+def test_no_keyword_passes_through():
+    result = apply_keyword_override("Thanks for the quick reply!", urgency="low")
+    assert result == {"urgency": "low", "urgency_override_applied": False}
+```
 
 > **Context digest:** Case-insensitive **substring** match (doc03 §3.2's explicit choice, not word-boundary). `urgency_override_applied` must reflect whether DR4 specifically fired — not just whether final urgency is "high".
 
@@ -510,6 +654,54 @@ def redact_pii(text: str) -> dict:
 - [Comprehend DetectPiiEntities](https://docs.aws.amazon.com/comprehend/latest/APIReference/API_DetectPiiEntities.html)
 - [Comprehend PII entity types](https://docs.aws.amazon.com/comprehend/latest/dg/how-pii.html)
 - [boto3 Comprehend client](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/comprehend.html)
+- [unittest.mock.patch.object](https://docs.python.org/3/library/unittest.mock.html#unittest.mock.patch.object)
+- [unittest.mock — quick guide](https://docs.python.org/3/library/unittest.mock-examples.html)
+
+**Sample Code — Comprehend API response shape:**
+
+```python
+# What comprehend.detect_pii_entities() returns:
+{
+    "Entities": [
+        {"Score": 0.9987, "Type": "NAME", "BeginOffset": 10, "EndOffset": 18},
+        {"Score": 0.9500, "Type": "PHONE", "BeginOffset": 35, "EndOffset": 47},
+        {"Score": 0.3000, "Type": "ADDRESS", "BeginOffset": 50, "EndOffset": 65},  # below threshold
+    ]
+}
+```
+
+**Sample Code — test with patch.object (moto doesn't support Comprehend):**
+
+```python
+from unittest.mock import patch
+import pii  # import as module so pii.comprehend is patchable
+
+def test_single_entity_redacted():
+    mock_response = {
+        "Entities": [
+            {"Score": 0.99, "Type": "NAME", "BeginOffset": 5, "EndOffset": 13}
+        ]
+    }
+    with patch.object(pii.comprehend, "detect_pii_entities", return_value=mock_response):
+        result = pii.redact_pii("Hello John Doe here")
+        assert result["redacted_text"] == "Hello [NAME] here"
+        assert result["pii_entities_detected"] == 1
+```
+
+**Sample Code — left-to-right reconstruction pattern:**
+
+```python
+# text = "Call John Doe at 555-1234"
+# entities (sorted): [{Type: NAME, Begin: 5, End: 13}, {Type: PHONE, Begin: 17, End: 25}]
+cursor = 0
+parts = []
+for entity in sorted_entities:
+    parts.append(text[cursor:entity["BeginOffset"]])  # "Call " / " at "
+    parts.append(f"[{entity['Type']}]")                # "[NAME]" / "[PHONE]"
+    cursor = entity["EndOffset"]
+parts.append(text[cursor:])  # "" (tail)
+redacted_text = "".join(parts)  # "Call [NAME] at [PHONE]"
+```
 
 > **Context digest:** Response = `{"Entities": [{"Score": float, "Type": str, "BeginOffset": int, "EndOffset": int}]}`. Offsets are character positions in original text. Sort by `BeginOffset` before reconstruction (Comprehend doesn't guarantee order). Only redact entities with `Score >= 0.5`.
 
@@ -600,6 +792,96 @@ def classify(body_text: str) -> dict: ...
 - [Anthropic Messages format on Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html)
 - [Bedrock supported models](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html)
 - [StreamingBody (botocore)](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/response.html#botocore.response.StreamingBody)
+- [json.JSONDecodeError](https://docs.python.org/3/library/json.html#json.JSONDecodeError)
+- [io.BytesIO](https://docs.python.org/3/library/io.html#io.BytesIO)
+
+**Sample Code — Bedrock invoke_model request + response:**
+
+```python
+import json
+
+# REQUEST (Anthropic Messages format for Bedrock):
+response = bedrock.invoke_model(
+    modelId="anthropic.claude-3-haiku-20240307-v1:0",
+    contentType="application/json",
+    accept="application/json",
+    body=json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 512,
+        "temperature": 0.0,
+        "system": "Return ONLY a JSON object with these fields: ...",
+        "messages": [{"role": "user", "content": "Classify this email: ..."}]
+    })
+)
+
+# RESPONSE — response["body"] is a StreamingBody:
+envelope = json.loads(response["body"].read())
+# envelope = {"content": [{"type": "text", "text": '{"category":"billing",...}'}]}
+model_text = envelope["content"][0]["text"]  # a JSON STRING needing second decode
+parsed = json.loads(model_text)              # {"category": "billing", "urgency": "high", ...}
+```
+
+**Sample Code — mock_bedrock_response helper + test pattern:**
+
+```python
+import io
+import json
+from unittest.mock import patch
+import classify
+
+def mock_bedrock_response(text: str) -> dict:
+    """Simulates Bedrock's StreamingBody — io.BytesIO has .read()"""
+    envelope = json.dumps({"content": [{"type": "text", "text": text}]}).encode()
+    return {"body": io.BytesIO(envelope)}
+
+def test_valid_response_on_first_attempt():
+    valid_json = json.dumps({
+        "category": "billing",
+        "urgency": "high",
+        "sentiment": "negative",
+        "confidence": "high",
+        "suggested_reply": "We'll investigate the charge.",
+        "feature_tags": []
+    })
+    with patch.object(classify.bedrock, "invoke_model",
+                      return_value=mock_bedrock_response(valid_json)) as mock_invoke:
+        result = classify.classify("I was charged twice for my subscription")
+        assert result["category"] == "billing"
+        assert result["classification_failed"] is False
+        assert mock_invoke.call_count == 1
+
+def test_invalid_then_valid_triggers_retry():
+    valid_json = json.dumps({"category": "billing", "urgency": "high",
+                             "sentiment": "negative", "confidence": "high",
+                             "suggested_reply": "...", "feature_tags": []})
+    with patch.object(classify.bedrock, "invoke_model",
+                      side_effect=[
+                          mock_bedrock_response("not json at all"),   # attempt 1 fails
+                          mock_bedrock_response(valid_json),          # attempt 2 succeeds
+                      ]) as mock_invoke:
+        result = classify.classify("some email text")
+        assert result["classification_failed"] is False
+        assert mock_invoke.call_count == 2
+        # Verify attempt 2 used larger max_tokens:
+        second_call_body = json.loads(mock_invoke.call_args_list[1][1]["body"])
+        assert second_call_body["max_tokens"] == 768
+```
+
+**Sample Code — single-read boundary test (test #7):**
+
+```python
+class SingleReadBytesIO(io.BytesIO):
+    """Raises on second .read() to catch accidental double-reads."""
+    def __init__(self, data):
+        super().__init__(data)
+        self._read_count = 0
+
+    def read(self, *args):
+        self._read_count += 1
+        if self._read_count > 1:
+            raise IOError("StreamingBody read twice!")
+        return super().read(*args)
+```
 
 > **Context digest:** Double JSON decode — `response["body"].read()` gives the Bedrock envelope `{"content": [{"type": "text", "text": "..."}]}`; that `text` field is itself a JSON string needing a second `json.loads()`. Attempt 1 = `max_tokens=512`; attempt 2 = `max_tokens=768` (guards truncation). Enum values defined HERE (not doc03). DEGRADE-not-RAISE on Bedrock failure (doc03 §4.5).
 
@@ -723,6 +1005,63 @@ def put_triage_record(record: dict) -> None: ...
 - [Table.get_item](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/dynamodb/table/get_item.html)
 - [Table.put_item](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/dynamodb/table/put_item.html)
 - [DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
+- [Resource API vs Client API](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/migration.html#resource-objects)
+- [datetime.fromisoformat](https://docs.python.org/3/library/datetime.html#datetime.datetime.fromisoformat)
+- [moto DynamoDB support](https://docs.getmoto.org/en/latest/docs/services/dynamodb.html)
+
+**Sample Code — get_item response shapes:**
+
+```python
+# When item EXISTS:
+response = table.get_item(Key={"email_id": "abc123"})
+# response = {"Item": {"email_id": "abc123", "category": "billing", ...}, "ResponseMetadata": {...}}
+item = response.get("Item")  # {"email_id": "abc123", ...}
+
+# When item DOES NOT EXIST:
+response = table.get_item(Key={"email_id": "nonexistent"})
+# response = {"ResponseMetadata": {...}}  — NO "Item" key at all!
+item = response.get("Item")  # None (NOT KeyError)
+```
+
+**Sample Code — TTL calculation:**
+
+```python
+from datetime import datetime, timezone
+
+received_at_str = "2026-06-21T14:30:00+00:00"
+received_at = datetime.fromisoformat(received_at_str)
+ttl = int(received_at.timestamp()) + (90 * 24 * 60 * 60)  # epoch + 90 days
+```
+
+**Sample Code — test with moto + reload:**
+
+```python
+import importlib, os, boto3
+from moto import mock_aws
+
+@mock_aws
+def test_put_then_get_roundtrip():
+    os.environ["DYNAMODB_TABLE_NAME"] = "EmailTriageResults-dev"
+
+    # Create table under mock
+    dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+    dynamodb.create_table(
+        TableName="EmailTriageResults-dev",
+        KeySchema=[{"AttributeName": "email_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "email_id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    # Reload so module-level `table` binds to moto
+    import persist
+    importlib.reload(persist)
+
+    record = {"email_id": "msg-001", "received_at": "2026-06-21T10:00:00+00:00", ...}
+    persist.put_triage_record(record)
+    result = persist.get_existing_record("msg-001")
+    assert result is not None
+    assert result["email_id"] == "msg-001"
+```
 
 > **Context digest:** Uses `boto3.resource` (not client) — accepts/returns native Python types (no `{"S": "..."}` wrappers). `get_item` response has **no `"Item"` key** when not found (not `None`), so use `.get("Item")`. `processed_at` and `ttl` are computed at write time, not passed in.
 
@@ -803,6 +1142,76 @@ def handler(event, context):
 **External Docs:**
 - [SQS event source mapping for Lambda](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html)
 - [Lambda event source mapping (batch size)](https://docs.aws.amazon.com/lambda/latest/dg/API_CreateEventSourceMapping.html)
+- [SQS Lambda event format](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html#example-standard-queue-message-event)
+- [Python importlib.reload](https://docs.python.org/3/library/importlib.html#importlib.reload)
+
+**Sample Code — SQS event shape (what `event` looks like):**
+
+```python
+event = {
+    "Records": [{
+        "body": '{"email_id":"msg-001","from_address":"jane@example.com","subject":"Help","body":"I need help with...","received_at":"2026-06-21T10:00:00+00:00","raw_s3_key":"raw-emails/msg-001"}'
+    }]
+}
+# Note: body is a JSON STRING, not a dict — must json.loads() it
+message = json.loads(event["Records"][0]["body"])
+```
+
+**Sample Code — double-mocking pattern (moto + patch.object):**
+
+```python
+import importlib, os, json, boto3
+from unittest.mock import patch
+from moto import mock_aws
+
+@mock_aws
+def test_happy_path():
+    os.environ["DYNAMODB_TABLE_NAME"] = "EmailTriageResults-dev"
+    os.environ["ALERT_TOPIC_ARN"] = "arn:aws:sns:us-east-1:123:alert-topic"
+
+    # Create DynamoDB table (moto supports it)
+    dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+    dynamodb.create_table(
+        TableName="EmailTriageResults-dev",
+        KeySchema=[{"AttributeName": "email_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "email_id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    # Reload modules inside mock context
+    import persist, pii, classify, handler
+    importlib.reload(persist)
+
+    # Patch services moto doesn't support
+    mock_pii_response = {"Entities": []}
+    mock_classify_result = {
+        "category": "billing", "urgency": "high", "sentiment": "negative",
+        "confidence": "high", "suggested_reply": "...", "feature_tags": [],
+        "classification_failed": False
+    }
+
+    with patch.object(pii.comprehend, "detect_pii_entities", return_value=mock_pii_response), \
+         patch.object(classify.bedrock, "invoke_model", return_value=mock_bedrock_response(valid_json)):
+        importlib.reload(handler)
+        handler.handler(event, None)
+        # Assert DynamoDB has the record
+        result = persist.get_existing_record("msg-001")
+        assert result is not None
+```
+
+**Sample Code — importing siblings as modules (for patchability):**
+
+```python
+# CORRECT — keeps pii.comprehend, classify.bedrock accessible for tests:
+import pii
+import classify
+import keyword_rules
+import persist
+
+# WRONG — loses the reference path tests need to patch:
+from pii import redact_pii
+from classify import classify
+```
 
 > **Context digest:** `event["Records"][0]["body"]` is a JSON string (batch_size=1). Idempotency guard runs FIRST. No try/except — RAISE on Comprehend/DynamoDB failure. Bedrock failures don't raise (classify degrades internally). `keyword_input` = `subject + " " + redacted_text` (not raw body). Import siblings as modules (not `from X import Y`) to keep clients patchable.
 
@@ -884,8 +1293,78 @@ def _emit_emf(record: dict, classification_failed: bool, alert_publish_failed: b
 **External Docs:**
 - [SNS Publish with MessageAttributes](https://docs.aws.amazon.com/sns/latest/api/API_Publish.html)
 - [SNS subscription filter policies](https://docs.aws.amazon.com/sns/latest/dg/sns-subscription-filter-policies.html)
+- [SNS MessageAttributes format](https://docs.aws.amazon.com/sns/latest/dg/sns-message-attributes.html)
 - [CloudWatch Embedded Metric Format spec](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html)
-- [EMF Python examples](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Libraries.html)
+- [EMF specification (JSON schema)](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html#CloudWatch_Embedded_Metric_Format_Specification_structure)
+- [pytest capsys fixture](https://docs.pytest.org/en/stable/how-to/capture-warnings.html)
+- [moto SNS support](https://docs.getmoto.org/en/latest/docs/services/sns.html)
+
+**Sample Code — SNS publish with MessageAttributes:**
+
+```python
+sns.publish(
+    TopicArn=os.environ["ALERT_TOPIC_ARN"],
+    Message=json.dumps(alert_body),
+    MessageAttributes={
+        "alert_type": {
+            "DataType": "String",
+            "StringValue": "urgent"  # subscribers filter on this
+        }
+    }
+)
+```
+
+**Sample Code — EMF document structure:**
+
+```python
+emf_document = {
+    "_aws": {
+        "Timestamp": 1719000000000,
+        "CloudWatchMetrics": [{
+            "Namespace": "ECHO",
+            "Dimensions": [["sentiment"]],
+            "Metrics": [
+                {"Name": "SentimentCount", "Unit": "Count"},
+                {"Name": "PiiEntitiesDetected", "Unit": "Count"},
+                # Conditional — only included when True:
+                # {"Name": "ClassificationFailure", "Unit": "Count"},
+                # {"Name": "AlertPublishFailure", "Unit": "Count"},
+            ]
+        }]
+    },
+    "sentiment": "negative",       # dimension value
+    "SentimentCount": 1,           # metric value
+    "PiiEntitiesDetected": 3,      # metric value
+    # "ClassificationFailure": 1,  # only if classification_failed
+    # "AlertPublishFailure": 1,    # only if sns.publish raised
+}
+print(json.dumps(emf_document))  # CloudWatch parses this from stdout
+```
+
+**Sample Code — testing EMF output with capsys:**
+
+```python
+def test_emf_includes_sentiment_count(capsys):
+    # ... invoke handler ...
+    captured = capsys.readouterr()
+    emf = json.loads(captured.out.strip())
+    assert emf["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "ECHO"
+    assert emf["sentiment"] == "negative"
+    assert emf["SentimentCount"] == 1
+```
+
+**Sample Code — DEGRADE pattern (try/except on SNS):**
+
+```python
+alert_publish_failed = False
+try:
+    sns.publish(TopicArn=os.environ["ALERT_TOPIC_ARN"],
+                Message=json.dumps(alert_body),
+                MessageAttributes={"alert_type": {"DataType": "String", "StringValue": alert_type}})
+except Exception:
+    alert_publish_failed = True
+    # Do NOT re-raise — persist already succeeded, avoid re-running Bedrock/Comprehend
+```
 
 > **Context digest:** `_alert_type` precedence: `urgent` > `needs_review` > `none`. SNS publish is wrapped in try/except — DEGRADE, not RAISE (avoids re-running Bedrock/Comprehend on redelivery). One EMF document per invocation via `print(json.dumps(...))` — namespace `ECHO`, dimension `sentiment`. `ClassificationFailure` and `AlertPublishFailure` are conditional metrics.
 
@@ -984,6 +1463,42 @@ def get_auto_processed_records() -> list[dict]: ...
 - [DynamoDB Scan](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html)
 - [boto3 DynamoDB conditions](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/customizations/dynamodb.html#ref-valid-dynamodb-conditions)
 - [Table.scan](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/dynamodb/table/scan.html)
+- [DynamoDB Scan pagination](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.Pagination)
+- [DynamoDB reserved words](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ReservedWords.html)
+
+**Sample Code — Scan with filter + projection + pagination:**
+
+```python
+from boto3.dynamodb.conditions import Attr
+
+def get_auto_processed_records() -> list[dict]:
+    records = []
+    scan_kwargs = {
+        "FilterExpression": Attr("review_status").eq("auto_processed"),
+        "ProjectionExpression": "category, urgency, sentiment, feature_tags, received_at",
+    }
+    while True:
+        response = table.scan(**scan_kwargs)
+        records.extend(response["Items"])
+        if "LastEvaluatedKey" not in response:
+            break
+        scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+    return records
+```
+
+**Sample Code — testing pagination with patch.object:**
+
+```python
+from unittest.mock import patch
+
+def test_pagination_concatenates_pages():
+    page1 = {"Items": [{"category": "billing", ...}], "LastEvaluatedKey": {"email_id": "x"}}
+    page2 = {"Items": [{"category": "praise", ...}]}
+
+    with patch.object(query.table, "scan", side_effect=[page1, page2]):
+        result = query.get_auto_processed_records()
+        assert len(result) == 2
+```
 
 > **Context digest:** `Scan` reads the entire table (fine at demo scale). `FilterExpression=Attr("review_status").eq("auto_processed")`. `ProjectionExpression="category, urgency, sentiment, feature_tags, received_at"` — 5 fields only (data-minimization). Loop on `LastEvaluatedKey` for pagination hygiene.
 
@@ -1061,6 +1576,51 @@ def synthesize(records: list[dict], question: str) -> dict: ...
 **External Docs:**
 - [Bedrock InvokeModel API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html)
 - [Anthropic Messages format on Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html)
+- [botocore Config reference](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html)
+
+**Sample Code — differences from 4.3's classify.py (side-by-side):**
+
+```python
+# classify.py (4.3):                    # synthesize.py (5.2):
+# BEDROCK_CONFIG (from layer)           # INSIGHTS_BEDROCK_CONFIG (local)
+#   max_attempts=3, read_timeout=10     #   max_attempts=2, read_timeout=5
+# temperature=0.0                       # temperature=0.3
+# max_tokens=512 / 768 (retry)         # max_tokens=400 (both attempts)
+# Response: 6-field schema              # Response: {"answer": "<string>"}
+# Returns: {..., classification_failed} # Returns: {"answer": ..., synthesis_failed}
+```
+
+**Sample Code — user message construction:**
+
+```python
+def _invoke(records: list[dict], question: str, system_prompt: str) -> str:
+    user_content = f"Records: {json.dumps(records)}\n\nQuestion: {question}"
+    response = bedrock.invoke_model(
+        modelId=MODEL_ID,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 400,
+            "temperature": 0.3,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_content}]
+        })
+    )
+    return json.loads(response["body"].read())["content"][0]["text"]
+```
+
+**Sample Code — config regression test:**
+
+```python
+from retry_config import BEDROCK_CONFIG
+import synthesize
+
+def test_insights_config_is_distinct():
+    assert synthesize.INSIGHTS_BEDROCK_CONFIG is not BEDROCK_CONFIG
+    assert synthesize.INSIGHTS_BEDROCK_CONFIG.retries == {"max_attempts": 2, "mode": "adaptive"}
+    assert synthesize.INSIGHTS_BEDROCK_CONFIG.read_timeout == 5
+```
 
 > **Context digest:** Different from 4.3: `temperature=0.3` (not 0.0), `max_tokens=400`, `max_attempts=2` (not 3), `read_timeout=5` (not 10). Response schema is just `{"answer": "<string>"}`. `records=[]` is valid input (model says "no data yet"). Returns `{"answer": ..., "synthesis_failed": bool}`.
 
@@ -1142,6 +1702,59 @@ def handler(event, context): ...
 **External Docs:**
 - [API Gateway Lambda proxy integration](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-proxy-integrations.html)
 - [Lambda proxy response format](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-proxy-integrations.html#api-gateway-simple-proxy-for-lambda-output-format)
+- [API Gateway proxy event format](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-proxy-integrations.html#api-gateway-simple-proxy-for-lambda-input-format)
+- [HTTP status codes — 502 vs 503](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status)
+
+**Sample Code — API Gateway proxy event (what `event` looks like):**
+
+```python
+event = {
+    "body": '{"question": "What are the most common feature requests?"}',
+    "httpMethod": "POST",
+    "path": "/insights",
+    "headers": {"Content-Type": "application/json"},
+    # ... other API Gateway fields (not used by this handler)
+}
+# IMPORTANT: event["body"] is a STRING, not a dict!
+request_body = json.loads(event["body"])
+question = request_body["question"]
+```
+
+**Sample Code — proxy integration response format:**
+
+```python
+# 200 — success:
+return {
+    "statusCode": 200,
+    "body": json.dumps({"answer": "The most common...", "records_considered": 12}),
+    "headers": {"Content-Type": "application/json"}
+}
+
+# 503 — synthesis failed (Bedrock exhausted retries):
+return {
+    "statusCode": 503,
+    "body": json.dumps({"error": "synthesis_unavailable", "records_considered": 12}),
+    "headers": {"Content-Type": "application/json"}
+}
+# Note: body must be a STRING (json.dumps), not a raw dict!
+```
+
+**Sample Code — SynthesisFailure EMF (no dimensions):**
+
+```python
+emf_document = {
+    "_aws": {
+        "Timestamp": 1719000000000,
+        "CloudWatchMetrics": [{
+            "Namespace": "ECHO",
+            "Dimensions": [[]],  # empty — no dimensions for this metric
+            "Metrics": [{"Name": "SynthesisFailure", "Unit": "Count"}]
+        }]
+    },
+    "SynthesisFailure": 1
+}
+print(json.dumps(emf_document))
+```
 
 > **Context digest:** `event["body"]` is a JSON **string** (proxy integration). Return must be `{"statusCode": int, "body": <JSON string>, "headers": {...}}`. 503 is specifically for `synthesis_failed=True` — DynamoDB Scan failure RAISEs (→ API Gateway 502). `records_considered = len(records)` included in both 200 and 503.
 
@@ -1203,6 +1816,60 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 - [Terraform AWS Provider docs](https://registry.terraform.io/providers/hashicorp/aws/latest/docs)
 - [checkov AWS checks](https://www.checkov.io/5.Policy%20Index/terraform.html)
 - [Terraform backend S3](https://developer.hashicorp.com/terraform/language/backend/s3)
+- [Terraform `jsonencode` function](https://developer.hashicorp.com/terraform/language/functions/jsonencode)
+- [Terraform `for_each` meta-argument](https://developer.hashicorp.com/terraform/language/meta-arguments/for_each)
+- [Terraform `data` sources](https://developer.hashicorp.com/terraform/language/data-sources)
+- [Terraform `depends_on`](https://developer.hashicorp.com/terraform/language/meta-arguments/depends_on)
+- [checkov inline suppressions](https://www.checkov.io/2.Basics/Suppressing%20and%20Skipping%20Policies.html)
+
+**Sample Code — checkov suppression pattern:**
+
+```hcl
+resource "aws_s3_bucket" "raw_emails" {
+  bucket = "echo-raw-emails-${var.env}"
+  #checkov:skip=CKV_AWS_18: No access logging — demo-scale cost tradeoff, doc03 §8.1
+  #checkov:skip=CKV_AWS_21: Versioning intentionally disabled, doc03 §8.1
+}
+```
+
+**Sample Code — data source for account ID:**
+
+```hcl
+data "aws_caller_identity" "current" {}
+
+# Usage:
+resource "aws_s3_bucket_policy" "raw_emails" {
+  bucket = aws_s3_bucket.raw_emails.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ses.amazonaws.com" }
+      Action    = "s3:PutObject"
+      Resource  = "${aws_s3_bucket.raw_emails.arn}/*"
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+      }
+    }]
+  })
+}
+```
+
+**Sample Code — module structure (3-file convention):**
+
+```hcl
+# modules/s3/variables.tf
+variable "env" { type = string }
+variable "region" { type = string }
+
+# modules/s3/outputs.tf
+output "bucket_id"   { value = aws_s3_bucket.raw_emails.id }
+output "bucket_arn"  { value = aws_s3_bucket.raw_emails.arn }
+output "bucket_name" { value = aws_s3_bucket.raw_emails.bucket }
+
+# modules/s3/main.tf
+# (all resources live here)
+```
 
 ---
 
@@ -1219,6 +1886,54 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 **Validation:**
 - Suppress `CKV_AWS_18` (access logging) and `CKV_AWS_21` (versioning) — deliberate doc03 §8.1 decisions.
 - First use of `data "aws_caller_identity" "current"` for account ID in the bucket policy.
+
+**External Docs:**
+- [aws_s3_bucket](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket)
+- [aws_s3_bucket_server_side_encryption_configuration](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_server_side_encryption_configuration)
+- [aws_s3_bucket_public_access_block](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_public_access_block)
+- [aws_s3_bucket_lifecycle_configuration](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_lifecycle_configuration)
+- [SES receiving email setup](https://docs.aws.amazon.com/ses/latest/dg/receiving-email-setting-up.html)
+
+**Sample Code:**
+
+```hcl
+resource "aws_s3_bucket" "raw_emails" {
+  bucket = "echo-raw-emails-${var.env}"
+  #checkov:skip=CKV_AWS_18: No access logging — demo-scale, doc03 §8.1
+  #checkov:skip=CKV_AWS_21: Versioning disabled by design, doc03 §8.1
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "raw_emails" {
+  bucket = aws_s3_bucket.raw_emails.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "raw_emails" {
+  bucket                  = aws_s3_bucket.raw_emails.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "raw_emails" {
+  bucket = aws_s3_bucket.raw_emails.id
+  versioning_configuration { status = "Disabled" }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "raw_emails" {
+  bucket = aws_s3_bucket.raw_emails.id
+  rule {
+    id     = "expire-90-days"
+    status = "Enabled"
+    expiration { days = 90 }
+  }
+}
+```
 
 <details><summary><b>Build order + design notes</b></summary>
 
@@ -1244,6 +1959,38 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 
 > **Flag for Phase 7:** Domain verification (MX + TXT DNS records) is a manual step (7.1 step 2), not a Terraform resource in this module.
 
+**External Docs:**
+- [aws_ses_receipt_rule_set](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ses_receipt_rule_set)
+- [aws_ses_receipt_rule](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ses_receipt_rule)
+- [SES receiving email — S3 action](https://docs.aws.amazon.com/ses/latest/dg/receiving-email-action-s3.html)
+- [SES email receiving concepts](https://docs.aws.amazon.com/ses/latest/dg/receiving-email-concepts.html)
+
+**Sample Code:**
+
+```hcl
+resource "aws_ses_receipt_rule_set" "main" {
+  rule_set_name = "echo-receipt-rules-${var.env}"
+}
+
+resource "aws_ses_active_receipt_rule_set" "main" {
+  rule_set_name = aws_ses_receipt_rule_set.main.rule_set_name
+}
+
+resource "aws_ses_receipt_rule" "store_to_s3" {
+  name          = "store-to-s3"
+  rule_set_name = aws_ses_receipt_rule_set.main.rule_set_name
+  recipients    = [var.ses_recipient_address]
+  enabled       = true
+  scan_enabled  = true  # spam/virus scanning
+
+  s3_action {
+    bucket_name       = var.bucket_name
+    object_key_prefix = "raw-emails/"
+    position          = 1
+  }
+}
+```
+
 <details><summary><b>Build order + design notes</b></summary>
 
 **Build order**: rule_set → active_rule_set → receipt_rule. Terraform resolves from resource references (no explicit `depends_on`).
@@ -1265,6 +2012,39 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 **Inputs → Outputs:** `variables.tf` = `env`, `sqs_visibility_timeout`, `sqs_max_receive_count`. `outputs.tf` = `queue_arn`, `queue_url`, `dlq_arn`.
 
 **Validation:** `CKV_AWS_27` (encryption) should pass cleanly with `sqs_managed_sse_enabled=true`.
+
+**External Docs:**
+- [aws_sqs_queue](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sqs_queue)
+- [aws_sqs_queue_redrive_allow_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sqs_queue_redrive_allow_policy)
+- [SQS dead-letter queues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
+
+**Sample Code:**
+
+```hcl
+resource "aws_sqs_queue" "dlq" {
+  name                      = "echo-triage-dlq-${var.env}"
+  message_retention_seconds = 1209600  # 14 days
+  sqs_managed_sse_enabled   = true
+}
+
+resource "aws_sqs_queue" "main" {
+  name                       = "echo-triage-queue-${var.env}"
+  visibility_timeout_seconds = var.sqs_visibility_timeout
+  sqs_managed_sse_enabled    = true
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = var.sqs_max_receive_count
+  })
+}
+
+resource "aws_sqs_queue_redrive_allow_policy" "dlq" {
+  queue_url = aws_sqs_queue.dlq.id
+  redrive_allow_policy = jsonencode({
+    redrivePermission = "byQueue"
+    sourceQueueArns   = [aws_sqs_queue.main.arn]
+  })
+}
+```
 
 <details><summary><b>Build order + design notes</b></summary>
 
@@ -1290,6 +2070,38 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 
 > **Phase 7 note:** Email subscriptions start as `PendingConfirmation` — must click the confirmation link.
 
+**External Docs:**
+- [aws_sns_topic](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sns_topic)
+- [aws_sns_topic_subscription](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sns_topic_subscription)
+- [SNS subscription filter policies](https://docs.aws.amazon.com/sns/latest/dg/sns-subscription-filter-policies.html)
+
+**Sample Code:**
+
+```hcl
+resource "aws_sns_topic" "alert" {
+  name = "echo-alert-topic-${var.env}"
+  #checkov:skip=CKV_AWS_26: No KMS per doc03 §6, demo-scale
+}
+
+resource "aws_sns_topic_subscription" "alert_urgent" {
+  topic_arn = aws_sns_topic.alert.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+  filter_policy = jsonencode({
+    alert_type = ["urgent"]
+  })
+}
+
+resource "aws_sns_topic_subscription" "alert_needs_review" {
+  topic_arn = aws_sns_topic.alert.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+  filter_policy = jsonencode({
+    alert_type = ["needs_review"]
+  })
+}
+```
+
 <details><summary><b>Build order + design notes</b></summary>
 
 **Build order**: both topics and subscriptions are independent — 4 sibling resources, no ordering dependency.
@@ -1312,6 +2124,35 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 
 **Validation:**
 - `CKV_AWS_28` (point-in-time recovery) — **fix** with `point_in_time_recovery { enabled = true }` (one line, no cost at demo scale).
+
+**External Docs:**
+- [aws_dynamodb_table](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/dynamodb_table)
+- [DynamoDB TTL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)
+- [DynamoDB billing modes](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadWriteCapacityMode.html)
+
+**Sample Code:**
+
+```hcl
+resource "aws_dynamodb_table" "triage_results" {
+  name         = "EmailTriageResults-${var.env}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "email_id"
+
+  attribute {
+    name = "email_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = true  # fixes CKV_AWS_28, no cost at PAY_PER_REQUEST
+  }
+}
+```
 
 <details><summary><b>Build order + design notes</b></summary>
 
@@ -1338,6 +2179,91 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 - Suppress broad deployer permissions — doc05 §5.4 rationale.
 - `data.tls_certificate` requires live HTTPS to `token.actions.githubusercontent.com` at plan time.
 
+**External Docs:**
+- [aws_iam_role](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role)
+- [aws_iam_role_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy)
+- [aws_iam_openid_connect_provider](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_openid_connect_provider)
+- [GitHub OIDC with AWS](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
+- [IAM policy elements reference](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements.html)
+- [Lambda execution role](https://docs.aws.amazon.com/lambda/latest/dg/lambda-intro-execution-role.html)
+
+**Sample Code — Lambda execution role + inline policy:**
+
+```hcl
+resource "aws_iam_role" "lambda_triage" {
+  name = "echo-lambda-triage-${var.env}"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "lambda_triage" {
+  name = "echo-lambda-triage-policy"
+  role = aws_iam_role.lambda_triage.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+        Resource = var.sqs_queue_arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["comprehend:DetectPiiEntities"]
+        Resource = "*"  # AWS-imposed — no resource-level scoping
+        #checkov:skip=CKV_AWS_111: comprehend has no resource-level permissions
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["bedrock:InvokeModel"]
+        Resource = "arn:aws:bedrock:${var.region}::foundation-model/anthropic.*"
+      },
+      # ... (DynamoDB, SNS, Logs, X-Ray statements from doc03 §6.2)
+    ]
+  })
+}
+```
+
+**Sample Code — GitHub OIDC provider + trust policy:**
+
+```hcl
+data "tls_certificate" "github_oidc" {
+  url = "https://token.actions.githubusercontent.com"
+}
+
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.github_oidc.certificates[0].sha1_fingerprint]
+}
+
+resource "aws_iam_role" "github_actions" {
+  name = "ECHOGitHubActionsRole"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+        }
+        StringLike = {
+          "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:*"
+        }
+      }
+    }]
+  })
+}
+```
+
 <details><summary><b>Build order + design notes</b></summary>
 
 **Build order**: 3 execution roles (transcription of doc03 §6.1-6.3); OIDC chain: `data "tls_certificate"` → `openid_connect_provider` → role → policy.
@@ -1362,6 +2288,71 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 - X-Ray tracing should pass cleanly. Suppress reserved-concurrency findings (demo-scale).
 - Lambda#3 `timeout = 28` must be hardcoded (not a variable).
 - S3 notification needs explicit `depends_on = [aws_lambda_permission.s3_invoke_ingest]`.
+
+**External Docs:**
+- [aws_lambda_function](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function)
+- [aws_lambda_layer_version](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_layer_version)
+- [aws_lambda_permission](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_permission)
+- [aws_lambda_event_source_mapping](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_event_source_mapping)
+- [aws_s3_bucket_notification](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_notification)
+- [Lambda X-Ray tracing](https://docs.aws.amazon.com/lambda/latest/dg/services-xray.html)
+
+**Sample Code — Lambda function with layer + env vars:**
+
+```hcl
+resource "aws_lambda_layer_version" "shared_utils" {
+  layer_name          = "echo-shared-utils-${var.env}"
+  filename            = "${var.lambda_artifacts_dir}/shared_utils_layer.zip"
+  source_code_hash    = filebase64sha256("${var.lambda_artifacts_dir}/shared_utils_layer.zip")
+  compatible_runtimes = ["python3.13"]
+}
+
+resource "aws_lambda_function" "triage" {
+  function_name    = "echo-triage-${var.env}"
+  filename         = "${var.lambda_artifacts_dir}/lambda_triage.zip"
+  source_code_hash = filebase64sha256("${var.lambda_artifacts_dir}/lambda_triage.zip")
+  handler          = "handler.handler"
+  runtime          = "python3.13"
+  architectures    = ["arm64"]
+  role             = var.lambda2_role_arn
+  timeout          = var.lambda2_timeout
+  layers           = [aws_lambda_layer_version.shared_utils.arn]
+
+  tracing_config { mode = "Active" }
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = var.dynamodb_table_name
+      ALERT_TOPIC_ARN     = var.sns_alert_topic_arn
+    }
+  }
+}
+```
+
+**Sample Code — S3 notification with depends_on:**
+
+```hcl
+resource "aws_lambda_permission" "s3_invoke_ingest" {
+  statement_id   = "AllowS3Invoke"
+  action         = "lambda:InvokeFunction"
+  function_name  = aws_lambda_function.ingest.function_name
+  principal      = "s3.amazonaws.com"
+  source_arn     = var.s3_bucket_arn
+  source_account = data.aws_caller_identity.current.account_id
+}
+
+resource "aws_s3_bucket_notification" "ingest_trigger" {
+  bucket = var.s3_bucket_id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.ingest.arn
+    events             = ["s3:ObjectCreated:*"]
+    filter_prefix      = "raw-emails/"
+  }
+
+  depends_on = [aws_lambda_permission.s3_invoke_ingest]
+}
+```
 
 <details><summary><b>Build order + design notes</b></summary>
 
@@ -1388,6 +2379,42 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 - `execution_arn` is `(known after apply)` for new APIs — expected.
 - Confirm `integration_http_method = "POST"` (required for Lambda proxy regardless of API method).
 
+**External Docs:**
+- [aws_api_gateway_rest_api](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/api_gateway_rest_api)
+- [aws_api_gateway_integration](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/api_gateway_integration)
+- [API Gateway IAM authorization](https://docs.aws.amazon.com/apigateway/latest/developerguide/permissions.html)
+- [API Gateway Lambda proxy integration](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-proxy-integrations.html)
+
+**Sample Code — REST API → resource → method → integration chain:**
+
+```hcl
+resource "aws_api_gateway_rest_api" "insights" {
+  name = "echo-insights-${var.env}"
+}
+
+resource "aws_api_gateway_resource" "insights" {
+  rest_api_id = aws_api_gateway_rest_api.insights.id
+  parent_id   = aws_api_gateway_rest_api.insights.root_resource_id
+  path_part   = "insights"
+}
+
+resource "aws_api_gateway_method" "insights_post" {
+  rest_api_id   = aws_api_gateway_rest_api.insights.id
+  resource_id   = aws_api_gateway_resource.insights.id
+  http_method   = "POST"
+  authorization = "AWS_IAM"
+}
+
+resource "aws_api_gateway_integration" "insights_lambda" {
+  rest_api_id             = aws_api_gateway_rest_api.insights.id
+  resource_id             = aws_api_gateway_resource.insights.id
+  http_method             = aws_api_gateway_method.insights_post.http_method
+  integration_http_method = "POST"  # Always POST for Lambda proxy!
+  type                    = "AWS_PROXY"
+  uri                     = var.lambda3_invoke_arn
+}
+```
+
 <details><summary><b>Build order + design notes</b></summary>
 
 **Build order**: rest_api → resource → method → integration → deployment → stage. Permission + InsightsCaller reference the API's own `execution_arn`.
@@ -1411,6 +2438,63 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 **Validation:**
 - `terraform validate` won't catch malformed dashboard JSON — only console/apply surfaces that.
 - EMF-based alarms reference metrics that don't exist yet (`INSUFFICIENT_DATA` until Lambda runs) — expected.
+
+**External Docs:**
+- [aws_cloudwatch_dashboard](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_dashboard)
+- [aws_cloudwatch_metric_alarm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm)
+- [CloudWatch anomaly detection](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Anomaly_Detection.html)
+- [aws_lambda_function_event_invoke_config](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function_event_invoke_config)
+- [CloudWatch dashboard body syntax](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/CloudWatch-Dashboard-Body-Structure.html)
+
+**Sample Code — DLQ-depth alarm:**
+
+```hcl
+resource "aws_cloudwatch_metric_alarm" "dlq_depth" {
+  alarm_name          = "echo-dlq-depth-${var.env}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 0
+  alarm_actions       = [var.ops_alarms_topic_arn]
+  dimensions = {
+    QueueName = "echo-triage-dlq-${var.env}"
+  }
+}
+```
+
+**Sample Code — anomaly detection alarm (different shape!):**
+
+```hcl
+resource "aws_cloudwatch_metric_alarm" "sentiment_anomaly" {
+  alarm_name          = "echo-negative-sentiment-anomaly-${var.env}"
+  comparison_operator = "LessThanLowerOrGreaterThanUpperThreshold"
+  evaluation_periods  = 3
+  threshold_metric_id = "ad1"
+  alarm_actions       = [var.ops_alarms_topic_arn]
+
+  metric_query {
+    id          = "m1"
+    return_data = true
+    metric {
+      metric_name = "SentimentCount"
+      namespace   = "ECHO"
+      period      = 300
+      stat        = "Sum"
+      dimensions  = { sentiment = "negative" }
+    }
+  }
+
+  metric_query {
+    id          = "ad1"
+    expression  = "ANOMALY_DETECTION_BAND(m1, 2)"
+    label       = "Negative sentiment anomaly band"
+    return_data = true
+  }
+}
+```
 
 <details><summary><b>Build order + design notes</b></summary>
 
@@ -1487,6 +2571,62 @@ No `terraform apply` in Phase 6 — that's Phase 7.
 **Validation:**
 - Items use DynamoDB's typed-attribute wire format (`{"S": "..."}`, `{"L": [...]}`). A missing type wrapper is a validate-time error.
 - Use synthetic prefix (`demo-email-001`) for `email_id` values — avoids collision with real SES messageIds.
+
+**External Docs:**
+- [aws_dynamodb_table_item](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/dynamodb_table_item)
+- [DynamoDB JSON format (typed attributes)](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.NamingRulesDataTypes.html)
+- [Terraform `for_each` with `jsondecode`](https://developer.hashicorp.com/terraform/language/meta-arguments/for_each)
+- [Terraform `file` function](https://developer.hashicorp.com/terraform/language/functions/file)
+
+**Sample Code — seed data JSON file (`seed-data/email_triage_results.json`):**
+
+```json
+[
+  {
+    "email_id": "demo-email-001",
+    "category": "feature_request",
+    "urgency": "medium",
+    "sentiment": "constructive",
+    "feature_tags": ["dark-mode", "mobile-app"],
+    "review_status": "auto_processed",
+    "received_at": "2026-06-20T09:00:00+00:00"
+  },
+  {
+    "email_id": "demo-email-002",
+    "category": "billing",
+    "urgency": "high",
+    "sentiment": "negative",
+    "feature_tags": [],
+    "review_status": "auto_processed",
+    "received_at": "2026-06-20T10:30:00+00:00"
+  }
+]
+```
+
+**Sample Code — for_each with typed-attribute conversion:**
+
+```hcl
+locals {
+  seed_records = jsondecode(file("${path.module}/seed-data/email_triage_results.json"))
+}
+
+resource "aws_dynamodb_table_item" "seed" {
+  for_each   = { for r in local.seed_records : r.email_id => r }
+  table_name = var.dynamodb_table_name
+  hash_key   = "email_id"
+
+  # DynamoDB wire format — every value needs a type wrapper:
+  item = jsonencode({
+    email_id      = { S = each.value.email_id }
+    category      = { S = each.value.category }
+    urgency       = { S = each.value.urgency }
+    sentiment     = { S = each.value.sentiment }
+    review_status = { S = each.value.review_status }
+    received_at   = { S = each.value.received_at }
+    feature_tags  = { L = [for tag in each.value.feature_tags : { S = tag }] }
+  })
+}
+```
 
 <details><summary><b>Build order + design notes</b></summary>
 
