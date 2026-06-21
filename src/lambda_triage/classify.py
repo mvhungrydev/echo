@@ -108,13 +108,15 @@ def _try_parse(raw_text: str) -> dict | None:
 
 def classify(body_text: str) -> dict:
     # Layer 2 retry (doc03 §4.3): attempt 1 → attempt 2 (corrective prompt) → degraded fallback
-    print("[classify] attempt 1 — SYSTEM_PROMPT, max_tokens=512")
+    print(f"[classify] attempt 1 — {SYSTEM_PROMPT}, max_tokens=512")
     parse_result = _try_parse(_invoke(body_text, SYSTEM_PROMPT, max_tokens=512))
     if parse_result is not None:
         print(f"[classify] attempt 1 succeeded: {parse_result}")
         return {**parse_result, "classification_failed": False}
     # retry with corrective prompt + larger max_tokens to guard against truncation (doc03 §8.7)
-    print("[classify] attempt 1 failed — retrying with RETRY_SYSTEM_PROMPT, max_tokens=768")
+    print(
+        f"[classify] attempt 1 failed — retrying with {RETRY_SYSTEM_PROMPT}, max_tokens=768"
+    )
     parse_result = _try_parse(_invoke(body_text, RETRY_SYSTEM_PROMPT, max_tokens=768))
     if parse_result is not None:
         print(f"[classify] attempt 2 succeeded: {parse_result}")
