@@ -177,6 +177,27 @@ BEDROCK_CONFIG = Config(...)   # retries adaptive/3, connect=3, read=10
 - [Retry behavior (adaptive mode)](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/retries.html)
 - [boto3 client configuration](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/configuration.html)
 
+**Input/Output Shapes:**
+
+```python
+# These are constants, not functions — here's how they're consumed and what attributes matter:
+
+# GENERAL_CONFIG — used by: S3, SQS, Comprehend, DynamoDB, SNS clients
+# Consumed as: boto3.client("s3", config=GENERAL_CONFIG)
+GENERAL_CONFIG.retries          # {"max_attempts": 3, "mode": "adaptive"}
+GENERAL_CONFIG.connect_timeout  # 3 (seconds)
+GENERAL_CONFIG.read_timeout     # 5 (seconds)
+
+# BEDROCK_CONFIG — used by: bedrock-runtime client only
+# Consumed as: boto3.client("bedrock-runtime", config=BEDROCK_CONFIG)
+BEDROCK_CONFIG.retries          # {"max_attempts": 3, "mode": "adaptive"}
+BEDROCK_CONFIG.connect_timeout  # 3 (seconds)
+BEDROCK_CONFIG.read_timeout     # 10 (seconds) — the ONE difference
+
+# Both are botocore.config.Config instances (isinstance check in tests)
+# Both are module-level constants — safe to share across clients (immutable)
+```
+
 **Sample Code — what the implementation looks like:**
 
 ```python
@@ -932,6 +953,36 @@ body_text = "Hi, my name is [NAME]. I was charged twice for my subscription on [
 
 # INTERNAL — what the MODEL returns (the raw text inside Bedrock envelope):
 '{"category":"billing","urgency":"high","sentiment":"negative","confidence":"high","suggested_reply":"We\'ll investigate...","feature_tags":[]}'
+
+# ─── INTERNAL HELPER SHAPES ───
+
+# _invoke(body_text: str, system_prompt: str, max_tokens: int) -> str
+# INPUT:
+#   body_text = "Hi, my name is [NAME]. I was charged twice..."
+#   system_prompt = SYSTEM_PROMPT (or RETRY_SYSTEM_PROMPT on attempt 2)
+#   max_tokens = 512 (attempt 1) or 768 (attempt 2)
+# OUTPUT: the raw text string from the model (before second JSON decode):
+"'{"category":"billing","urgency":"high",...}'"  # valid — _try_parse will succeed
+"Sure! Here is the classification:\n{..."        # invalid — _try_parse returns None
+
+# _validate(parsed: dict) -> bool
+# INPUT: a dict that successfully json.loads'd from the model text:
+parsed = {"category": "billing", "urgency": "high", "sentiment": "negative",
+           "confidence": "high", "suggested_reply": "..."}
+# OUTPUT:
+True   # all REQUIRED_FIELDS present AND all enum values in their VALID_* sets
+False  # missing key (e.g. no "confidence") OR invalid value (e.g. urgency="critical")
+
+# _try_parse(raw_text: str) -> dict | None
+# INPUT: the raw string returned by _invoke():
+raw_text = '{"category":"billing","urgency":"high","sentiment":"negative","confidence":"high","suggested_reply":"...","feature_tags":["dark-mode"]}'
+# OUTPUT on success (valid JSON + passes _validate):
+{"category": "billing", "urgency": "high", "sentiment": "negative",
+ "confidence": "high", "suggested_reply": "...", "feature_tags": ["dark-mode"]}
+# OUTPUT on success when model omits feature_tags (setdefault adds it):
+{"category": "billing", ..., "feature_tags": []}  # [] added by setdefault
+# OUTPUT on failure (json.JSONDecodeError OR _validate returns False):
+None
 ```
 
 **Sample Code — Bedrock invoke_model request + response:**
@@ -1377,6 +1428,16 @@ record = {
     "pii_entities_detected": 1,                     # from pii_result
     "redacted_body": "Hi, my name is [NAME]. I was charged twice..."  # pii_result["redacted_text"]
 }
+
+# HANDLER RETURN VALUE:
+# - Normal path: returns None (implicit) — SQS deletes the message on success
+# - Idempotency short-circuit: returns None (explicit) — same effect
+# - Poison-pill / failure: raises (KeyError, etc.) — SQS redelivers up to maxReceiveCount
+# The handler has NO explicit return value — success = no exception raised
+
+# review_status logic:
+# "needs_review" if classification["confidence"] != "high" OR classification["classification_failed"]
+# "auto_processed" otherwise
 ```
 
 **Sample Code — double-mocking pattern (moto + patch.object):**
@@ -1567,6 +1628,22 @@ record = {
     "received_at": "...",
     "category": "praise", "urgency": "low", "sentiment": "positive", "confidence": "high"
 }
+
+# _emit_emf(record, classification_failed, alert_publish_failed) -> None
+# INPUT:
+#   record = the 15-field dict (uses record["sentiment"] and record["pii_entities_detected"])
+#   classification_failed = True/False (from classification["classification_failed"])
+#   alert_publish_failed = True/False (from the try/except around sns.publish)
+# OUTPUT: prints ONE JSON line to stdout (captured by CloudWatch Logs → EMF processor):
+
+# When classification_failed=False, alert_publish_failed=False:
+'{"_aws":{"Timestamp":...,"CloudWatchMetrics":[{"Namespace":"ECHO","Dimensions":[["sentiment"]],"Metrics":[{"Name":"SentimentCount","Unit":"Count"},{"Name":"PiiEntitiesDetected","Unit":"Count"}]}]},"sentiment":"negative","SentimentCount":1,"PiiEntitiesDetected":2}'
+
+# When classification_failed=True:
+# Same as above + "ClassificationFailure": 1 in top-level keys and Metrics array
+
+# When alert_publish_failed=True:
+# Same as above + "AlertPublishFailure": 1 in top-level keys and Metrics array
 ```
 
 **Sample Code — SNS publish with MessageAttributes:**
@@ -1907,6 +1984,26 @@ question = "What are the most common feature requests this week?"
     "answer": "No triage data is available yet. Once emails are processed...",
     "synthesis_failed": False  # still 200, not a failure
 }
+
+# ─── INTERNAL HELPER SHAPES ───
+
+# _invoke(records: list[dict], question: str, system_prompt: str) -> str
+# INPUT:
+#   records = [{"category": "billing", ...}, ...]  # the list from query
+#   question = "What are the most common feature requests?"
+#   system_prompt = SYSTEM_PROMPT (or RETRY_SYSTEM_PROMPT on attempt 2)
+# OUTPUT: the raw text string from the model (before second JSON decode):
+'{"answer": "The most common feature requests are dark-mode and mobile app support."}'
+# Or invalid text that triggers retry:
+'Here is my analysis:\n{"answer": "..."}'  # leading text → json.loads fails
+
+# _try_parse(raw_text: str) -> dict | None
+# INPUT: the string returned by _invoke()
+raw_text = '{"answer": "Based on the data, billing issues are the top concern."}'
+# OUTPUT on success (valid JSON + has "answer" key with str value):
+{"answer": "Based on the data, billing issues are the top concern."}
+# OUTPUT on failure (json fails, or "answer" missing, or "answer" not a str):
+None
 ```
 
 **Sample Code — differences from 4.3's classify.py (side-by-side):**
@@ -2075,6 +2172,14 @@ question = request_body["question"]
 
 # OUTPUT — 502 (DynamoDB Scan raises → uncaught → API Gateway generic 502):
 # NOT generated by this handler — it's what API Gateway returns when Lambda raises
+
+# ─── INTERNAL HELPER SHAPES ───
+
+# _emit_synthesis_failure_emf() -> None
+# INPUT: none (takes no arguments)
+# OUTPUT: prints ONE JSON line to stdout (only on the 503 path):
+'{"_aws":{"Timestamp":...,"CloudWatchMetrics":[{"Namespace":"ECHO","Dimensions":[[]],"Metrics":[{"Name":"SynthesisFailure","Unit":"Count"}]}]},"SynthesisFailure":1}'
+# Note: Dimensions is [[]] — no dimensions, unlike 4.6's [["sentiment"]]
 ```
 
 **Sample Code — proxy integration response format:**
