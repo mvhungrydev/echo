@@ -8,7 +8,9 @@ def test_general_config_is_config_instance():
 
 
 def test_general_config_retries():
-    assert GENERAL_CONFIG.retries == {"max_attempts": 3, "mode": "adaptive"}
+    # botocore resolves max_attempts=3 to total_max_attempts=4 (initial + 3 retries)
+    assert GENERAL_CONFIG.retries["mode"] == "adaptive"
+    assert GENERAL_CONFIG.retries["total_max_attempts"] == 4
 
 
 def test_general_config_timeouts():
@@ -21,7 +23,9 @@ def test_bedrock_config_is_config_instance():
 
 
 def test_bedrock_config_retries():
-    assert BEDROCK_CONFIG.retries == {"max_attempts": 3, "mode": "adaptive"}
+    # botocore resolves max_attempts=3 to total_max_attempts=4 (initial + 3 retries)
+    assert BEDROCK_CONFIG.retries["mode"] == "adaptive"
+    assert BEDROCK_CONFIG.retries["total_max_attempts"] == 4
 
 
 def test_bedrock_config_timeouts():
