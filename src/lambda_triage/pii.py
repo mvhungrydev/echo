@@ -30,6 +30,8 @@ def redact_pii(text: str) -> dict:
     for entity in entities:
         # copy the literal text between the previous entity (or string start) and this one
         parts.append(text[cursor : entity["BeginOffset"]])
+        original_value = text[entity["BeginOffset"] : entity["EndOffset"]]
+        print(f"[pii.redact_pii] redacting {entity['Type']}: '{original_value[:4]}...' (score={entity['Score']:.2f})")
         # substitute the entity's text span with its type label (e.g. "123-45-6789" → "[SSN]")
         parts.append(f"[{entity['Type']}]")
         # jump past the entity span; offsets reference the original string so no shifting needed
