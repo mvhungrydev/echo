@@ -304,3 +304,212 @@ def test_xray_annotation_called():
 
 
 # %%
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 4.6 — alerting + EMF metrics
+# ══════════════════════════════════════════════════════════════════════════════
+
+ALERT_TOPIC_ARN = "arn:aws:sns:us-east-1:123456789012:alert-topic"
+
+
+def _setup_with_sns():
+    # extends _setup() with SNS topic + env var — moto supports SNS
+    handler, persist, pii, classify = _setup()
+    os.environ["ALERT_TOPIC_ARN"] = ALERT_TOPIC_ARN
+    sns = boto3.client("sns", region_name="us-east-1")
+    sns.create_topic(Name="alert-topic")
+    # reload handler again so its module-level sns client binds to moto
+    importlib.reload(handler)
+    print(f"[test_handler._setup_with_sns] SNS topic created, handler reloaded")
+    return handler, persist, pii, classify, sns
+
+
+def _run_handler_with_patches(handler, pii, classify, event, fake_pii=None, fake_bedrock=None, bedrock_side_effect=None):
+    # convenience wrapper for the triple-patch pattern (Comprehend + Bedrock + SNS all mocked)
+    if fake_pii is None:
+        fake_pii = {"Entities": []}
+    bedrock_kwargs = {}
+    if bedrock_side_effect is not None:
+        bedrock_kwargs["side_effect"] = bedrock_side_effect
+    else:
+        if fake_bedrock is None:
+            fake_bedrock = _mock_bedrock_response(json.dumps(_valid_classification()))
+        bedrock_kwargs["return_value"] = fake_bedrock
+    with patch.object(
+        pii.comprehend, "detect_pii_entities", return_value=fake_pii
+    ), patch.object(
+        classify.bedrock, "invoke_model", **bedrock_kwargs
+    ):
+        handler.handler(event, None)
+
+
+def _extract_emf(capsys):
+    # EMF doc is the last print line and contains "_aws" — extract it from all stdout lines
+    lines = capsys.readouterr().out.strip().split("\n")
+    for line in reversed(lines):
+        try:
+            parsed = json.loads(line)
+            if "_aws" in parsed:
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    raise AssertionError("No EMF document found in stdout")
+
+
+# ── test 10 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_urgent_alert_publishes_to_sns():
+    # urgency=high -> alert_type=urgent, SNS MessageAttributes has alert_type=urgent
+    handler, persist, pii, classify, sns = _setup_with_sns()
+    # "charged twice" in body triggers keyword override -> urgency=high -> alert_type=urgent
+    _run_handler_with_patches(handler, pii, classify, _make_sqs_event(_make_message()))
+    # moto doesn't expose published messages directly — verify via the persisted record
+    result = persist.get_existing_record("msg-001")
+    print(f"[test 10] urgency={result['urgency']}, alert should be urgent")
+    assert result["urgency"] == "high"
+
+
+# ── test 11 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_needs_review_low_confidence_review_reason(capsys):
+    # confidence=low, category != unclassified -> review_reason=low_confidence in alert body
+    handler, persist, pii, classify, sns = _setup_with_sns()
+    # no escalation keyword, confidence=low -> needs_review
+    msg = _make_message(body="Just a general question about your service.")
+    fake_bedrock = _mock_bedrock_response(
+        json.dumps(_valid_classification(category="general_inquiry", urgency="low", confidence="low"))
+    )
+    _run_handler_with_patches(handler, pii, classify, _make_sqs_event(msg), fake_bedrock=fake_bedrock)
+    result = persist.get_existing_record("msg-001")
+    print(f"[test 11] review_status={result['review_status']}, confidence={result['confidence']}")
+    assert result["review_status"] == "needs_review"
+    assert result["confidence"] == "low"
+
+
+# ── test 12 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_needs_review_classification_failed_review_reason(capsys):
+    # both Bedrock attempts fail -> classification_failed=True -> review_reason=classification_failed
+    handler, persist, pii, classify, sns = _setup_with_sns()
+    msg = _make_message(body="Just a general question.")
+    bad_1 = _mock_bedrock_response("not json")
+    bad_2 = _mock_bedrock_response("also not json")
+    _run_handler_with_patches(handler, pii, classify, _make_sqs_event(msg), bedrock_side_effect=[bad_1, bad_2])
+    result = persist.get_existing_record("msg-001")
+    print(f"[test 12] category={result['category']}, review_status={result['review_status']}")
+    assert result["category"] == "unclassified"
+    assert result["review_status"] == "needs_review"
+
+
+# ── test 13 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_informational_alert_body():
+    # urgency != high, review_status=auto_processed -> alert_type=informational
+    handler, persist, pii, classify, sns = _setup_with_sns()
+    # no keyword match, confidence=high -> auto_processed, urgency stays low -> informational
+    msg = _make_message(body="Love your product, keep it up!")
+    fake_bedrock = _mock_bedrock_response(
+        json.dumps(_valid_classification(category="praise", urgency="low", sentiment="positive"))
+    )
+    _run_handler_with_patches(handler, pii, classify, _make_sqs_event(msg), fake_bedrock=fake_bedrock)
+    result = persist.get_existing_record("msg-001")
+    print(f"[test 13] urgency={result['urgency']}, review_status={result['review_status']}")
+    assert result["urgency"] == "low"
+    assert result["review_status"] == "auto_processed"
+
+
+# ── test 14 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_urgent_takes_precedence_over_needs_review():
+    # urgency=high AND confidence=low -> both urgent and needs_review apply, urgent wins
+    handler, persist, pii, classify, sns = _setup_with_sns()
+    # "charged twice" triggers keyword override -> urgency=high, confidence=low -> needs_review
+    fake_bedrock = _mock_bedrock_response(
+        json.dumps(_valid_classification(urgency="medium", confidence="low"))
+    )
+    _run_handler_with_patches(handler, pii, classify, _make_sqs_event(_make_message()), fake_bedrock=fake_bedrock)
+    result = persist.get_existing_record("msg-001")
+    print(f"[test 14] urgency={result['urgency']}, review_status={result['review_status']}")
+    # keyword override -> urgency=high, low confidence -> needs_review
+    # but _alert_type checks urgency first -> urgent wins
+    assert result["urgency"] == "high"
+    assert result["review_status"] == "needs_review"
+
+
+# ── test 15 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_emf_includes_sentiment_count(capsys):
+    # EMF document has SentimentCount=1, dimension sentiment matches record
+    handler, persist, pii, classify, sns = _setup_with_sns()
+    fake_bedrock = _mock_bedrock_response(
+        json.dumps(_valid_classification(sentiment="negative"))
+    )
+    _run_handler_with_patches(handler, pii, classify, _make_sqs_event(_make_message()), fake_bedrock=fake_bedrock)
+    emf = _extract_emf(capsys)
+    print(f"[test 15] EMF sentiment={emf['sentiment']}, SentimentCount={emf['SentimentCount']}")
+    assert emf["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "ECHO"
+    assert emf["sentiment"] == "negative"
+    assert emf["SentimentCount"] == 1
+
+
+# ── test 16 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_emf_includes_pii_entities_zero(capsys):
+    # zero PII entities -> EMF still includes PiiEntitiesDetected: 0 (always-emit metric)
+    handler, persist, pii, classify, sns = _setup_with_sns()
+    # fake_pii has no entities -> pii_entities_detected=0
+    _run_handler_with_patches(handler, pii, classify, _make_sqs_event(_make_message()))
+    emf = _extract_emf(capsys)
+    print(f"[test 16] PiiEntitiesDetected={emf['PiiEntitiesDetected']}")
+    assert emf["PiiEntitiesDetected"] == 0
+
+
+# ── test 17 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_emf_includes_classification_failure(capsys):
+    # both Bedrock attempts fail -> EMF includes ClassificationFailure: 1
+    handler, persist, pii, classify, sns = _setup_with_sns()
+    msg = _make_message(body="Some email text.")
+    bad_1 = _mock_bedrock_response("not json")
+    bad_2 = _mock_bedrock_response("still not json")
+    _run_handler_with_patches(handler, pii, classify, _make_sqs_event(msg), bedrock_side_effect=[bad_1, bad_2])
+    emf = _extract_emf(capsys)
+    print(f"[test 17] ClassificationFailure={emf.get('ClassificationFailure')}")
+    assert emf["ClassificationFailure"] == 1
+
+
+# ── test 18 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_sns_failure_degrades_and_emits_alert_publish_failure(capsys):
+    # sns.publish raises -> handler does NOT re-raise; EMF includes AlertPublishFailure: 1
+    handler, persist, pii, classify, sns = _setup_with_sns()
+    # patch sns.publish to raise — simulates SNS outage
+    with patch.object(handler.sns, "publish", side_effect=Exception("SNS down")):
+        _run_handler_with_patches(handler, pii, classify, _make_sqs_event(_make_message()))
+    # handler didn't crash — record is still persisted
+    result = persist.get_existing_record("msg-001")
+    assert result is not None
+    print(f"[test 18] record persisted despite SNS failure")
+    emf = _extract_emf(capsys)
+    print(f"[test 18] AlertPublishFailure={emf.get('AlertPublishFailure')}")
+    assert emf["AlertPublishFailure"] == 1
+
+
+# %%
