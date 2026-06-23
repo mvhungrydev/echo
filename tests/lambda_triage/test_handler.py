@@ -25,6 +25,7 @@ sys.path.insert(
     ),
 )
 
+
 TABLE_NAME = "EmailTriageResults-dev"
 
 
@@ -79,6 +80,10 @@ def _setup():
         AttributeDefinitions=[{"AttributeName": "email_id", "AttributeType": "S"}],
         BillingMode="PAY_PER_REQUEST",
     )
+    # evict modules that may have been cached from ingest tests — otherwise
+    # `import handler` returns src/lambda_ingest/handler.py instead of triage's
+    for mod in ("handler", "persist", "pii", "classify", "keyword_rules"):
+        sys.modules.pop(mod, None)
     # reload persist first so its module-level table binds to moto,
     # then handler so it picks up the reloaded persist/pii/classify
     import persist, pii, classify, handler

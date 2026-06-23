@@ -18,11 +18,6 @@ SHARED_UTILS = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "src", "layers", "shared_utils")
 )
 
-# moto requires fake credentials before any boto3 client is created;
-# these values are arbitrary — moto never validates them against real AWS
-os.environ["AWS_ACCESS_KEY_ID"] = "testing"
-os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
-os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
 
 
 def build_eml(

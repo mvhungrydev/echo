@@ -1,0 +1,33 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Testing / coverage
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Environment variables / secrets
+.env
+.env.*
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+terraform.tfvars
+
+# Keys and credentials
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Lambda deployment artifacts
+*.zip
+
+# Claude
+CLAUDE.md
+.claude/

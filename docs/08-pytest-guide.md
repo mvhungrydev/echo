@@ -8,6 +8,8 @@ This is the testing companion to doc06. Every story in doc06 follows **Red → G
 
 This doc covers the infrastructure that makes that loop work locally and in CI (doc05 §4.5: `pip install -r src/layers/shared_utils/requirements.txt -r requirements-dev.txt && pytest tests/`):
 
+> Tip: Windows users can run `./scripts/install-dev.ps1` and macOS/Linux users can run `./scripts/install-dev.sh` to create a `.venv` and install the required packages.
+
 1. `pytest.ini` — entry point / config
 2. `requirements-dev.txt`
 3. `tests/` directory layout
