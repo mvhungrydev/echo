@@ -72,6 +72,9 @@ def _valid_classification(**overrides) -> dict:
 def _setup():
     # double-mocking pattern: @mock_aws handles DynamoDB (moto supports it),
     # but Comprehend and Bedrock must be patched via patch.object in each test
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+    os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
     os.environ["DYNAMODB_TABLE_NAME"] = TABLE_NAME
     dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
     dynamodb.create_table(

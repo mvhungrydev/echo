@@ -28,6 +28,9 @@ TABLE_NAME = "EmailTriageResults-dev"
 
 
 def _setup():
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+    os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
     # env var must be set before reload — persist.py reads it at import time
     os.environ["DYNAMODB_TABLE_NAME"] = TABLE_NAME
     # create the table under moto before reload so persist's module-level

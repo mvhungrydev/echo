@@ -37,6 +37,9 @@ def build_eml(
 
 def _setup():
     """Create mock S3/SQS resources and import handler against the mock backend."""
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+    os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
     s3 = boto3.client("s3")
     s3.create_bucket(Bucket=BUCKET)
 
