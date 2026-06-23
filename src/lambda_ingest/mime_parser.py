@@ -1,3 +1,4 @@
+import sys
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
@@ -28,5 +29,7 @@ def parse_email(raw_email: bytes) -> dict:
     else:
         body = ""
 
-    print(f"[mime_parser] from={from_address}, subject={subject[:50]}, body_len={len(body)}")
+    enc = sys.stdout.encoding or "utf-8"
+    subj_safe = subject[:50].encode(enc, errors="replace").decode(enc)
+    print(f"[mime_parser] from={from_address}, subject={subj_safe}, body_len={len(body)}")
     return {"from_address": from_address, "subject": subject, "body": body}

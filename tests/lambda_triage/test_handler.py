@@ -84,6 +84,14 @@ def _setup():
     # `import handler` returns src/lambda_ingest/handler.py instead of triage's
     for mod in ("handler", "persist", "pii", "classify", "keyword_rules"):
         sys.modules.pop(mod, None)
+    # ensure lambda_triage is at the front of sys.path so bare `import handler`
+    # resolves to triage's handler, not ingest's (which may also be on sys.path)
+    triage_src = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "src", "lambda_triage")
+    )
+    if triage_src in sys.path:
+        sys.path.remove(triage_src)
+    sys.path.insert(0, triage_src)
     # reload persist first so its module-level table binds to moto,
     # then handler so it picks up the reloaded persist/pii/classify
     import persist, pii, classify, handler
