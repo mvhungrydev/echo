@@ -141,4 +141,168 @@ def test_pagination_concatenates_pages():
     assert len(result) == 2
     assert result[0]["category"] == "billing"
     assert result[1]["category"] == "praise"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tests 6–15: query_triage_data (parameterized, 9-field projection)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── test 6 ────────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_no_filters_returns_all_auto_processed():
+    # no filters → returns every auto_processed record, excludes needs_review
+    query, table = _setup()
+    table.put_item(Item=_make_record())
+    table.put_item(Item=_make_record(email_id="msg-002"))
+    table.put_item(Item=_make_record(email_id="msg-003", review_status="needs_review"))
+    result = query.query_triage_data()
+    assert len(result) == 2
+
+
+# ── test 7 ────────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_category_filter():
+    # category="billing" → only billing records returned
+    query, table = _setup()
+    table.put_item(Item=_make_record())
+    table.put_item(Item=_make_record(email_id="msg-002", category="praise"))
+    result = query.query_triage_data(category="billing")
+    assert len(result) == 1
+    assert result[0]["category"] == "billing"
+
+
+# ── test 8 ────────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_multiple_filters_and():
+    # sentiment="negative" + category="billing" → intersection only
+    query, table = _setup()
+    table.put_item(Item=_make_record())  # billing + negative
+    table.put_item(Item=_make_record(email_id="msg-002", category="billing", sentiment="positive"))
+    table.put_item(Item=_make_record(email_id="msg-003", category="praise", sentiment="negative"))
+    result = query.query_triage_data(sentiment="negative", category="billing")
+    assert len(result) == 1
+    assert result[0]["category"] == "billing"
+    assert result[0]["sentiment"] == "negative"
+
+
+# ── test 9 ────────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_from_address_filter():
+    # from_address="jane@example.com" → only that sender
+    query, table = _setup()
+    table.put_item(Item=_make_record())  # jane@example.com
+    table.put_item(Item=_make_record(email_id="msg-002", from_address="bob@acme.com"))
+    result = query.query_triage_data(from_address="jane@example.com")
+    assert len(result) == 1
+    assert result[0]["from_address"] == "jane@example.com"
+
+
+# ── test 10 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_date_from_filter():
+    # date_from → records on/after that date
+    query, table = _setup()
+    table.put_item(Item=_make_record(received_at="2026-06-20T09:00:00+00:00"))
+    table.put_item(Item=_make_record(email_id="msg-002", received_at="2026-06-22T09:00:00+00:00"))
+    result = query.query_triage_data(date_from="2026-06-21T00:00:00+00:00")
+    assert len(result) == 1
+    assert result[0]["received_at"] == "2026-06-22T09:00:00+00:00"
+
+
+# ── test 11 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_date_range_filter():
+    # date_from + date_to → records within window only
+    query, table = _setup()
+    table.put_item(Item=_make_record(received_at="2026-06-19T09:00:00+00:00"))
+    table.put_item(Item=_make_record(email_id="msg-002", received_at="2026-06-21T10:00:00+00:00"))
+    table.put_item(Item=_make_record(email_id="msg-003", received_at="2026-06-23T09:00:00+00:00"))
+    result = query.query_triage_data(
+        date_from="2026-06-20T00:00:00+00:00",
+        date_to="2026-06-22T00:00:00+00:00",
+    )
+    assert len(result) == 1
+    assert result[0]["received_at"] == "2026-06-21T10:00:00+00:00"
+
+
+# ── test 12 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_returns_nine_projected_fields():
+    # returned records have exactly 9 fields, not 5 or 17
+    query, table = _setup()
+    table.put_item(Item=_make_record())
+    result = query.query_triage_data()
+    expected_keys = {
+        "email_id", "from_address", "subject", "redacted_body",
+        "category", "urgency", "sentiment", "feature_tags", "received_at",
+    }
+    assert set(result[0].keys()) == expected_keys
+
+
+# ── test 13 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_excludes_needs_review_even_with_matching_filters():
+    # needs_review excluded even when category/sentiment filters match
+    query, table = _setup()
+    table.put_item(Item=_make_record(review_status="needs_review"))
+    table.put_item(Item=_make_record(email_id="msg-002"))  # auto_processed
+    result = query.query_triage_data(category="billing")
+    assert len(result) == 1
+    assert result[0]["email_id"] == "msg-002"
+
+
+# ── test 14 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_no_matches_returns_empty():
+    # filters that match nothing → []
+    query, table = _setup()
+    table.put_item(Item=_make_record())  # billing, not praise
+    result = query.query_triage_data(category="praise")
+    assert result == []
+
+
+# ── test 15 ───────────────────────────────────────────────────────────────────
+
+
+@mock_aws
+def test_query_triage_data_pagination():
+    # mocked pagination — 2 pages concatenated
+    query, table = _setup()
+    from unittest.mock import patch
+    page1 = {
+        "Items": [{"email_id": "msg-001", "from_address": "a@b.com", "subject": "S1",
+                   "redacted_body": "body1", "category": "billing", "urgency": "high",
+                   "sentiment": "negative", "feature_tags": [],
+                   "received_at": "2026-06-21T10:00:00+00:00"}],
+        "LastEvaluatedKey": {"email_id": "msg-001"},
+    }
+    page2 = {
+        "Items": [{"email_id": "msg-002", "from_address": "c@d.com", "subject": "S2",
+                   "redacted_body": "body2", "category": "praise", "urgency": "low",
+                   "sentiment": "positive", "feature_tags": [],
+                   "received_at": "2026-06-20T09:00:00+00:00"}],
+    }
+    with patch.object(query.table, "scan", side_effect=[page1, page2]):
+        result = query.query_triage_data()
+    assert len(result) == 2
+    assert result[0]["email_id"] == "msg-001"
+    assert result[1]["email_id"] == "msg-002"
 # %%
