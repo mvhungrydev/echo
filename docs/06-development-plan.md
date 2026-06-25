@@ -16,9 +16,9 @@
 | 4.4 | `lambda_triage/persist.py` | TODO | 2.1 |
 | 4.5 | `lambda_triage/handler.py` (orchestration) | TODO | 4.1–4.4 |
 | 4.6 | `lambda_triage/handler.py` (alerting + EMF) | TODO | 4.5 |
-| 5.1 | `lambda_insights/query.py` | TODO | 2.1 |
-| 5.2 | `lambda_insights/synthesize.py` | TODO | 2.1 |
-| 5.3 | `lambda_insights/handler.py` | TODO | 5.1, 5.2 |
+| 5.1 | `lambda_insights/query.py` (parameterized + original) | DONE (original) / ◀ NEXT (parameterized) | 2.1 |
+| 5.2 | `lambda_insights/synthesize.py` (Bedrock tool use) | TODO | 5.1 |
+| 5.3 | `lambda_insights/handler.py` | TODO | 5.2 |
 | 6.1 | `infra/modules/s3` | TODO | — |
 | 6.2 | `infra/modules/ses` | TODO | 6.1 |
 | 6.3 | `infra/modules/sqs` | TODO | — |
@@ -1776,11 +1776,13 @@ Helper: `capsys`-based assertion reads the single `print()`'d EMF JSON line.
 
 Per doc03 §5.2, Lambda#3 has 3 files: `handler.py`, `query.py`, `synthesize.py`. Three stories in dependency order.
 
+**Design change (2026-06-24):** Synthesize now uses **Bedrock tool use** instead of receiving pre-loaded records. The model decides what to query based on the user's natural-language question, calls a `query_triage_data` tool, and synthesizes an answer from the results. This enables filtered lookups ("show me negative billing emails"), record-level analysis ("what are customers saying about outages"), and multi-step comparisons ("compare billing vs bug report sentiment").
+
 ---
 
 ### 5.1 `query.py`
 
-**Goal:** DynamoDB Scan with filter (`review_status="auto_processed"`) and projection (5 fields only), with pagination loop.
+**Goal:** DynamoDB Scan with filter (`review_status="auto_processed"`) and projection, with pagination loop. Two functions: the original 5-field full scan (`get_auto_processed_records`) and a new parameterized 9-field query (`query_triage_data`) used by Bedrock tool use.
 
 **Prereqs:** 2.1 (`GENERAL_CONFIG`). moto fully supports DynamoDB Scan. Module-level `table` requires `importlib.reload(query)` inside `mock_aws()`.
 
@@ -1796,15 +1798,33 @@ from retry_config import GENERAL_CONFIG
 dynamodb = boto3.resource("dynamodb", config=GENERAL_CONFIG)
 table = dynamodb.Table(os.environ["DYNAMODB_TABLE_NAME"])
 
-def get_auto_processed_records() -> list[dict]: ...
+def get_auto_processed_records() -> list[dict]: ...  # existing — 5 projected fields
+
+def query_triage_data(
+    *,
+    category: str | None = None,
+    sentiment: str | None = None,
+    urgency: str | None = None,
+    from_address: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict]: ...  # new — 9 projected fields, parameterized filters
 ```
 
 **TDD Order (Red → Green):**
-1. test #1 (filter returns only auto_processed) → build basic Scan with FilterExpression
-2. test #2 (only 5 projected fields returned) → add ProjectionExpression
-3. test #3 (empty table → `[]`) → should pass already
-4. test #4 (`feature_tags` list round-trips) → should pass with resource API
-5. test #5 (pagination boundary — mocked multi-page) → add `LastEvaluatedKey` loop
+
+*Existing `get_auto_processed_records` (tests 1–5) — already DONE.*
+
+*New `query_triage_data` (tests 6–15):*
+1. test #6 (no filters → all auto_processed) → build basic `query_triage_data` with base filter
+2. test #7 (category filter) → add category `Attr` chaining
+3. test #8 (sentiment + category) → add multi-filter AND
+4. test #9 (from_address filter) → add from_address filter
+5. test #12 (9 projected fields) → set expanded ProjectionExpression
+6. test #10 + #11 (date range filters) → add date_from/date_to with `gte`/`lte`
+7. test #13 (needs_review excluded) → should pass already (base filter)
+8. test #14 (no matches → `[]`) → should pass already
+9. test #15 (pagination) → reuse `LastEvaluatedKey` loop pattern
 
 **External Docs:**
 - [DynamoDB Scan](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html)
@@ -1816,41 +1836,69 @@ def get_auto_processed_records() -> list[dict]: ...
 **Input/Output Shapes:**
 
 ```python
-# INPUT — none (function takes no arguments)
+# ─── get_auto_processed_records (existing, unchanged) ───
 
+# INPUT — none (function takes no arguments)
 # OUTPUT — list of dicts, each with EXACTLY these 5 projected fields:
 [
+    {"category": "billing", "urgency": "high", "sentiment": "negative",
+     "feature_tags": [], "received_at": "2026-06-21T10:00:00+00:00"},
+]
+
+# ─── query_triage_data (new — used by Bedrock tool use) ───
+
+# INPUT — all keyword-only, all optional:
+query_triage_data()                                    # no filters — all auto_processed
+query_triage_data(category="billing")                  # single filter
+query_triage_data(sentiment="negative", urgency="high") # multiple filters AND'd
+query_triage_data(from_address="jane@example.com")     # exact sender match
+query_triage_data(date_from="2026-06-20T00:00:00+00:00")  # on/after date
+query_triage_data(date_from="2026-06-20T00:00:00+00:00",
+                  date_to="2026-06-21T23:59:59+00:00") # date window
+
+# OUTPUT — list of dicts, each with EXACTLY these 9 projected fields:
+[
     {
+        "email_id": "msg-001",
+        "from_address": "jane@example.com",
+        "subject": "Charged twice for June",
+        "redacted_body": "Hi, my name is [NAME]. I was charged twice...",
         "category": "billing",
         "urgency": "high",
         "sentiment": "negative",
-        "feature_tags": [],                    # always present, [] for non-feature_request
+        "feature_tags": [],
         "received_at": "2026-06-21T10:00:00+00:00"
     },
-    {
-        "category": "feature_request",
-        "urgency": "low",
-        "sentiment": "constructive",
-        "feature_tags": ["dark-mode", "mobile-app"],  # populated for feature_request
-        "received_at": "2026-06-20T09:00:00+00:00"
-    },
-    # ... more items (only review_status="auto_processed" included)
 ]
 
-# OUTPUT — empty table or no matching items:
+# OUTPUT — no matching records:
 []
 ```
 
-**Sample Code — Scan with filter + projection + pagination:**
+**Sample Code — parameterized scan with Attr AND chaining:**
 
 ```python
-from boto3.dynamodb.conditions import Attr
+def query_triage_data(*, category=None, sentiment=None, urgency=None,
+                      from_address=None, date_from=None, date_to=None) -> list[dict]:
+    filter_expr = Attr("review_status").eq("auto_processed")
+    if category is not None:
+        filter_expr = filter_expr & Attr("category").eq(category)
+    if sentiment is not None:
+        filter_expr = filter_expr & Attr("sentiment").eq(sentiment)
+    if urgency is not None:
+        filter_expr = filter_expr & Attr("urgency").eq(urgency)
+    if from_address is not None:
+        filter_expr = filter_expr & Attr("from_address").eq(from_address)
+    if date_from is not None:
+        filter_expr = filter_expr & Attr("received_at").gte(date_from)
+    if date_to is not None:
+        filter_expr = filter_expr & Attr("received_at").lte(date_to)
 
-def get_auto_processed_records() -> list[dict]:
     records = []
     scan_kwargs = {
-        "FilterExpression": Attr("review_status").eq("auto_processed"),
-        "ProjectionExpression": "category, urgency, sentiment, feature_tags, received_at",
+        "FilterExpression": filter_expr,
+        "ProjectionExpression": "email_id, from_address, subject, redacted_body, "
+                                "category, urgency, sentiment, feature_tags, received_at",
     }
     while True:
         response = table.scan(**scan_kwargs)
@@ -1861,28 +1909,17 @@ def get_auto_processed_records() -> list[dict]:
     return records
 ```
 
-**Sample Code — testing pagination with patch.object:**
-
-```python
-from unittest.mock import patch
-
-def test_pagination_concatenates_pages():
-    page1 = {"Items": [{"category": "billing", ...}], "LastEvaluatedKey": {"email_id": "x"}}
-    page2 = {"Items": [{"category": "praise", ...}]}
-
-    with patch.object(query.table, "scan", side_effect=[page1, page2]):
-        result = query.get_auto_processed_records()
-        assert len(result) == 2
-```
-
-> **Context digest:** `Scan` reads the entire table (fine at demo scale). `FilterExpression=Attr("review_status").eq("auto_processed")`. `ProjectionExpression="category, urgency, sentiment, feature_tags, received_at"` — 5 fields only (data-minimization). Loop on `LastEvaluatedKey` for pagination hygiene.
+> **Context digest:** `query_triage_data` is the tool Bedrock calls — parameterized filters layered with `&` (AND) on top of the `review_status="auto_processed"` base filter. Projects 9 fields (existing 5 + `email_id`, `from_address`, `subject`, `redacted_body`). Date filtering works because ISO 8601 strings are lexicographically ordered. `get_auto_processed_records` (5-field, no params) stays for backward compatibility.
 
 <details><summary><b>Background & design decisions</b></summary>
 
 - `table.scan(FilterExpression=..., ProjectionExpression=...)` — DynamoDB `Scan` reads the entire table and applies filter server-side. Fine at demo scale; would need a GSI at production scale.
-- `ProjectionExpression="category, urgency, sentiment, feature_tags, received_at"` — projects only 5 fields. None are DynamoDB reserved words, so no `ExpressionAttributeNames` needed.
+- **Two functions**: `get_auto_processed_records()` (original, 5 fields, no params) kept for backward compat. `query_triage_data()` (new, 9 fields, parameterized) used by Bedrock tool use.
+- **`Attr` AND chaining**: `filter_expr & Attr("category").eq(...)` — boto3 `Attr` objects support `&` for AND conditions. Each optional param adds a condition.
+- **Date range**: ISO 8601 strings are lexicographically ordered, so `Attr("received_at").gte(date_from)` works as a date comparison. No need to parse to epoch.
+- **Expanded projection**: adds `email_id`, `from_address`, `subject`, `redacted_body` so Bedrock can identify, attribute, and summarize specific emails.
+- None of the 9 field names are DynamoDB reserved words, so no `ExpressionAttributeNames` needed.
 - **Pagination**: `scan()` returns at most 1MB per call. Loop on `LastEvaluatedKey`.
-- This module constructs its own `dynamodb`/`table` objects (separate deployment package from `persist.py`).
 - moto fully supports Scan with FilterExpression and ProjectionExpression.
 
 </details>
@@ -1890,6 +1927,8 @@ def test_pagination_concatenates_pages():
 <details><summary><b>Full test table + implementation</b></summary>
 
 **Test** (`tests/lambda_insights/test_query.py`)
+
+*Existing tests (1–5) — unchanged, cover `get_auto_processed_records`:*
 
 | # | Test | Why it matters |
 |---|------|----------------|
@@ -1899,14 +1938,32 @@ def test_pagination_concatenates_pages():
 | 4 | `feature_tags` list round-trips correctly through projection | FR6 into /insights |
 | 5 | **Boundary**: mocked pagination (2 pages) → both pages concatenated | Pins pagination loop |
 
+*New tests (6–15) — cover `query_triage_data`:*
+
+| # | Test | Why it matters |
+|---|------|----------------|
+| 6 | No filters → returns all auto_processed records | Baseline — same records as `get_auto_processed_records` but with 9 fields |
+| 7 | `category="billing"` → only billing records returned | Single filter correctness |
+| 8 | `sentiment="negative"` + `category="billing"` → intersection only | Multiple filters AND correctly |
+| 9 | `from_address="jane@example.com"` → only that sender | from_address filter |
+| 10 | `date_from="2026-06-21T00:00:00+00:00"` → records on/after that date | Date lower bound |
+| 11 | `date_from` + `date_to` → records within window only | Date range |
+| 12 | Returned records have exactly 9 projected fields | Expanded projection |
+| 13 | `needs_review` records excluded even when other filters match | Base filter always applies |
+| 14 | No matching records → `[]` | Empty result |
+| 15 | **Boundary**: mocked pagination (2 pages) → both pages concatenated | Pagination works with parameterized query |
+
 **Implementation**
 
-`get_auto_processed_records() -> list[dict]`
+`get_auto_processed_records() -> list[dict]` — unchanged (see existing code).
 
-1. `records = []`, `scan_kwargs = {"FilterExpression": Attr("review_status").eq("auto_processed"), "ProjectionExpression": "category, urgency, sentiment, feature_tags, received_at"}`.
-2. `response = table.scan(**scan_kwargs)`, extend `records` with `response["Items"]`.
-3. If `"LastEvaluatedKey"` in response: set `scan_kwargs["ExclusiveStartKey"]`, repeat step 2.
-4. Return `records`.
+`query_triage_data(*, category, sentiment, urgency, from_address, date_from, date_to) -> list[dict]`
+
+1. Build `filter_expr = Attr("review_status").eq("auto_processed")`.
+2. For each non-`None` param, chain with `& Attr("<field>").eq(<value>)` (or `.gte`/`.lte` for dates).
+3. `scan_kwargs = {"FilterExpression": filter_expr, "ProjectionExpression": "email_id, from_address, subject, redacted_body, category, urgency, sentiment, feature_tags, received_at"}`.
+4. Pagination loop: `table.scan(**scan_kwargs)`, extend `records`, check `LastEvaluatedKey`.
+5. Return `records`.
 
 </details>
 
@@ -1914,9 +1971,9 @@ def test_pagination_concatenates_pages():
 
 ### 5.2 `synthesize.py`
 
-**Goal:** Call Bedrock to synthesize a natural-language answer from triage records. Same Layer 2 retry pattern as 4.3 but with a tightened config, different temperature, and simpler response schema (`{"answer": "..."}`).
+**Goal:** Multi-turn Bedrock tool use loop — model decides what to query based on the user's question, calls a `query_triage_data` tool (fulfilled by `query.py`), and synthesizes a natural-language answer from the results. Layer 2 retry on invalid final answer. Tightened Bedrock config.
 
-**Prereqs:** None from other stories (defines its own `INSIGHTS_BEDROCK_CONFIG` locally). moto does NOT support `bedrock-runtime` — use `patch.object(synthesize.bedrock, "invoke_model", ...)`.
+**Prereqs:** 5.1 (`query_triage_data`). moto does NOT support `bedrock-runtime` — use `patch.object(synthesize.bedrock, "invoke_model", ...)`. `query_fn` is injected as a callable, so tests pass a mock instead of needing DynamoDB.
 
 **Signatures (build these):**
 
@@ -1931,79 +1988,207 @@ INSIGHTS_BEDROCK_CONFIG = Config(retries={"max_attempts": 2, "mode": "adaptive"}
 bedrock = boto3.client("bedrock-runtime", config=INSIGHTS_BEDROCK_CONFIG)
 MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
 
-SYSTEM_PROMPT = "..."
-RETRY_SYSTEM_PROMPT = "..."
+QUERY_TOOL = {
+    "name": "query_triage_data",
+    "description": "Query the email triage database. Returns records matching filters. "
+                   "All filters optional. Call multiple times with different filters to compare.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "enum": ["bug_report", "feature_request",
+                         "general_inquiry", "billing", "complaint", "praise"]},
+            "sentiment": {"type": "string", "enum": ["positive", "negative", "constructive"]},
+            "urgency": {"type": "string", "enum": ["high", "medium", "low"]},
+            "from_address": {"type": "string", "description": "Filter by sender (exact match)"},
+            "date_from": {"type": "string", "description": "ISO 8601 — records on/after this date"},
+            "date_to": {"type": "string", "description": "ISO 8601 — records on/before this date"},
+        },
+        "required": [],
+    },
+}
+MAX_TOOL_TURNS = 3  # cap on tool call rounds to prevent runaway
 
-def _invoke(records: list[dict], question: str, system_prompt: str) -> str: ...
+SYSTEM_PROMPT = "..."   # instructs model to use query_triage_data tool
+RETRY_SYSTEM_PROMPT = "..."  # corrective prompt for Layer 2 retry
+
+def _invoke_with_tools(question: str, system_prompt: str, query_fn: callable) -> tuple[str | None, int]: ...
 def _try_parse(raw_text: str) -> dict | None: ...
-def synthesize(records: list[dict], question: str) -> dict: ...
+def _extract_tool_calls(content: list[dict]) -> list[dict]: ...
+def _extract_text(content: list[dict]) -> str | None: ...
+def synthesize(question: str, query_fn: callable) -> dict: ...
 ```
 
 **TDD Order (Red → Green):**
-1. test #1 (happy path) → build `_invoke` + `_try_parse` + `synthesize` skeleton
-2. test #4 (missing/non-string `answer` → invalid) → build validation
-3. test #2 (retry on invalid) → wire attempt-2 with `RETRY_SYSTEM_PROMPT`
-4. test #3 (both fail → `synthesis_failed=True`) → add failure return
-5. test #5 (empty records → still invokes Bedrock) → confirm no short-circuit
-6. test #6 (temperature=0.3, max_tokens=400) → assert invoke params
-7. test #7 (tightened config is distinct from shared BEDROCK_CONFIG) → regression boundary
+1. test #1 (single tool call happy path) → build `_invoke_with_tools` + `_try_parse` + `synthesize` skeleton
+2. test #8 (query_fn called with exact kwargs) → wire tool input → `query_fn(**input)` passthrough
+3. test #3 (no tool use — direct answer) → add `stop_reason == "end_turn"` path
+4. test #2 (two tool calls for comparison) → handle multiple rounds
+5. test #4 (invalid answer → retry) → wire Layer 2 retry with `RETRY_SYSTEM_PROMPT`
+6. test #5 (both fail → degraded) → add failure return path
+7. test #6 (MAX_TOOL_TURNS exceeded) → add loop counter check
+8. test #7 (records_considered accumulates) → track counter across calls
+9. test #9 + #10 (request shape + message threading) → contract verification
+10. test #11 + #12 (config + params) → regression boundaries
 
 **External Docs:**
 - [Bedrock InvokeModel API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html)
 - [Anthropic Messages format on Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html)
+- [Anthropic tool use on Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html)
 - [botocore Config reference](https://botocore.amazonaws.com/v1/documentation/api/latest/reference/config.html)
 
 **Input/Output Shapes:**
 
 ```python
-# INPUT — records: the list from query.get_auto_processed_records() (5 fields each):
-records = [
-    {"category": "billing", "urgency": "high", "sentiment": "negative",
-     "feature_tags": [], "received_at": "2026-06-21T10:00:00+00:00"},
-    {"category": "feature_request", "urgency": "low", "sentiment": "constructive",
-     "feature_tags": ["dark-mode"], "received_at": "2026-06-20T09:00:00+00:00"},
-]
-
 # INPUT — question: the user's natural-language question:
-question = "What are the most common feature requests this week?"
+question = "Show me the negative sentiment billing emails"
+
+# INPUT — query_fn: a callable matching query.query_triage_data's signature
+#   injected by handler as query.query_triage_data
+#   in tests, a unittest.mock.Mock returning canned records
 
 # OUTPUT — synthesize() on SUCCESS:
 {
-    "answer": "Based on the triage data, the most requested feature is dark-mode support...",
+    "answer": "There are 3 negative billing emails this week...",
+    "records_considered": 3,        # total records across all tool calls
     "synthesis_failed": False
 }
 
 # OUTPUT — synthesize() on FAILURE (both attempts failed):
 {
     "answer": None,
-    "synthesis_failed": True  # handler turns this into HTTP 503
+    "records_considered": 0,
+    "synthesis_failed": True        # handler turns this into HTTP 503
 }
 
-# OUTPUT — synthesize() when records is empty:
+# ─── BEDROCK TOOL USE RESPONSE SHAPES ───
+
+# When model wants to call a tool (stop_reason="tool_use"):
 {
-    "answer": "No triage data is available yet. Once emails are processed...",
-    "synthesis_failed": False  # still 200, not a failure
+    "content": [
+        {"type": "text", "text": "I'll query for negative billing emails."},   # optional reasoning
+        {"type": "tool_use", "id": "toolu_001", "name": "query_triage_data",
+         "input": {"sentiment": "negative", "category": "billing"}}
+    ],
+    "stop_reason": "tool_use"
 }
+
+# When model gives final answer (stop_reason="end_turn"):
+{
+    "content": [
+        {"type": "text", "text": "{\"answer\": \"There are 3 negative billing emails...\"}"}
+    ],
+    "stop_reason": "end_turn"
+}
+
+# Tool result sent back to model (appended to messages):
+{"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "toolu_001",
+     "content": "[{\"email_id\": \"msg-001\", \"category\": \"billing\", ...}]"}
+]}
+
+# ─── MULTI-TURN MESSAGE SEQUENCE (full conversation) ───
+
+messages = [
+    # Turn 1: user asks question
+    {"role": "user", "content": "Show me negative billing emails"},
+    # Turn 2: model requests tool use
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_001", "name": "query_triage_data",
+         "input": {"sentiment": "negative", "category": "billing"}}
+    ]},
+    # Turn 3: we send tool results back
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_001",
+         "content": json.dumps(records)}
+    ]},
+    # Turn 4: model gives final answer (via invoke_model response, not in messages)
+]
 
 # ─── INTERNAL HELPER SHAPES ───
 
-# _invoke(records: list[dict], question: str, system_prompt: str) -> str
-# INPUT:
-#   records = [{"category": "billing", ...}, ...]  # the list from query
-#   question = "What are the most common feature requests?"
-#   system_prompt = SYSTEM_PROMPT (or RETRY_SYSTEM_PROMPT on attempt 2)
-# OUTPUT: the raw text string from the model (before second JSON decode):
-'{"answer": "The most common feature requests are dark-mode and mobile app support."}'
-# Or invalid text that triggers retry:
-'Here is my analysis:\n{"answer": "..."}'  # leading text → json.loads fails
+# _invoke_with_tools(question, system_prompt, query_fn) -> (str | None, int)
+# Returns (raw_final_text, records_considered) or (None, 0) on failure/timeout
 
-# _try_parse(raw_text: str) -> dict | None
-# INPUT: the string returned by _invoke()
-raw_text = '{"answer": "Based on the data, billing issues are the top concern."}'
-# OUTPUT on success (valid JSON + has "answer" key with str value):
-{"answer": "Based on the data, billing issues are the top concern."}
-# OUTPUT on failure (json fails, or "answer" missing, or "answer" not a str):
-None
+# _try_parse(raw_text) -> dict | None
+# Same as original: json.loads + validate "answer" key is str
+
+# _extract_tool_calls(content) -> list[dict]
+# Filters content blocks to type=="tool_use"
+
+# _extract_text(content) -> str | None
+# Finds first block with type=="text", returns its text value
+```
+
+**Sample Code — invoke_model with tools (Anthropic Messages format on Bedrock):**
+
+```python
+response = bedrock.invoke_model(
+    modelId=MODEL_ID,
+    contentType="application/json",
+    accept="application/json",
+    body=json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1024,
+        "temperature": 0.3,
+        "system": system_prompt,
+        "tools": [QUERY_TOOL],
+        "messages": messages,
+    })
+)
+response_body = json.loads(response["body"].read())
+# response_body has "content" (list of blocks) and "stop_reason"
+```
+
+**Sample Code — handling tool_use response + sending tool_result:**
+
+```python
+# After receiving a tool_use response:
+tool_calls = [b for b in response_body["content"] if b["type"] == "tool_use"]
+for tc in tool_calls:
+    records = query_fn(**tc["input"])
+    records_considered += len(records)
+
+# Append assistant response + tool results to messages:
+messages.append({"role": "assistant", "content": response_body["content"]})
+messages.append({"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": tc["id"], "content": json.dumps(records)}
+    for tc in tool_calls
+]})
+
+# Then call invoke_model again with updated messages
+```
+
+**Sample Code — test mock helpers:**
+
+```python
+def mock_tool_use_response(tool_calls: list[dict]) -> dict:
+    content = [{"type": "tool_use", "id": tc.get("id", "toolu_001"),
+                "name": tc["name"], "input": tc["input"]} for tc in tool_calls]
+    envelope = json.dumps({"content": content, "stop_reason": "tool_use"}).encode()
+    return {"body": io.BytesIO(envelope)}
+
+def mock_final_response(text: str) -> dict:
+    envelope = json.dumps({"content": [{"type": "text", "text": text}],
+                           "stop_reason": "end_turn"}).encode()
+    return {"body": io.BytesIO(envelope)}
+```
+
+**Sample Code — test pattern (single tool call happy path):**
+
+```python
+def test_single_tool_call_happy_path():
+    tool_resp = mock_tool_use_response([{
+        "name": "query_triage_data", "input": {"sentiment": "negative"}, "id": "toolu_001"}])
+    final_resp = mock_final_response(json.dumps({"answer": "3 negative emails found."}))
+    mock_query = Mock(return_value=[{"email_id": "msg-001", "category": "billing", ...}])
+
+    with patch.object(synthesize.bedrock, "invoke_model", side_effect=[tool_resp, final_resp]):
+        result = synthesize.synthesize("Show me negative emails", mock_query)
+
+    assert result["answer"] == "3 negative emails found."
+    assert result["records_considered"] == 1
+    assert result["synthesis_failed"] is False
+    mock_query.assert_called_once_with(sentiment="negative")
 ```
 
 **Sample Code — differences from 4.3's classify.py (side-by-side):**
@@ -2013,54 +2198,25 @@ None
 # BEDROCK_CONFIG (from layer)           # INSIGHTS_BEDROCK_CONFIG (local)
 #   max_attempts=3, read_timeout=10     #   max_attempts=2, read_timeout=5
 # temperature=0.0                       # temperature=0.3
-# max_tokens=512 / 768 (retry)         # max_tokens=400 (both attempts)
+# max_tokens=512 / 768 (retry)         # max_tokens=1024 (tool use JSON is verbose)
+# Single invoke → parse                # Multi-turn tool use loop
 # Response: 6-field schema              # Response: {"answer": "<string>"}
-# Returns: {..., classification_failed} # Returns: {"answer": ..., synthesis_failed}
+# Returns: {..., classification_failed} # Returns: {answer, records_considered, synthesis_failed}
 ```
 
-**Sample Code — user message construction:**
-
-```python
-def _invoke(records: list[dict], question: str, system_prompt: str) -> str:
-    user_content = f"Records: {json.dumps(records)}\n\nQuestion: {question}"
-    response = bedrock.invoke_model(
-        modelId=MODEL_ID,
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 400,
-            "temperature": 0.3,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_content}]
-        })
-    )
-    return json.loads(response["body"].read())["content"][0]["text"]
-```
-
-**Sample Code — config regression test:**
-
-```python
-from retry_config import BEDROCK_CONFIG
-import synthesize
-
-def test_insights_config_is_distinct():
-    assert synthesize.INSIGHTS_BEDROCK_CONFIG is not BEDROCK_CONFIG
-    assert synthesize.INSIGHTS_BEDROCK_CONFIG.retries == {"max_attempts": 2, "mode": "adaptive"}
-    assert synthesize.INSIGHTS_BEDROCK_CONFIG.read_timeout == 5
-```
-
-> **Context digest:** Different from 4.3: `temperature=0.3` (not 0.0), `max_tokens=400`, `max_attempts=2` (not 3), `read_timeout=5` (not 10). Response schema is just `{"answer": "<string>"}`. `records=[]` is valid input (model says "no data yet"). Returns `{"answer": ..., "synthesis_failed": bool}`.
+> **Context digest:** Uses Bedrock **tool use** — model receives a `query_triage_data` tool definition, decides what to query, calls the tool (possibly multiple times), then synthesizes an answer. `query_fn` is injected by handler (dependency injection for testability). Multi-turn message list builds up: user → assistant(tool_use) → user(tool_result) → ... → assistant(end_turn). `MAX_TOOL_TURNS=3` caps the loop. Layer 2 retry restarts the entire conversation if final answer is invalid. `records_considered` accumulates across all tool calls.
 
 <details><summary><b>Background & design decisions</b></summary>
 
-- Same overall shape as 4.3 but differs in: a tightened Bedrock config, different prompt/temperature/max_tokens, and a simpler response schema.
+- **Bedrock tool use** on Anthropic Messages format: include `"tools": [...]` in the request body. Model can respond with `stop_reason: "tool_use"` and `content` blocks of type `"tool_use"`. We execute the tool, send back `"tool_result"` blocks, and the model continues.
+- **Dependency injection**: `query_fn` parameter instead of importing `query` directly. Handler passes `query.query_triage_data`. Tests pass a `Mock`. Avoids circular imports and complex DynamoDB mocking in synthesize tests.
 - **`INSIGHTS_BEDROCK_CONFIG`** (doc03 §7.3): `max_attempts=2`, `connect_timeout=3`, `read_timeout=5`. Defined locally, NOT imported from `retry_config.py`.
-- `temperature=0.3` (synthesis produces prose), `max_tokens=400`.
-- `MODEL_ID` — same pinned model as classify.py, but redefined locally.
-- **Response schema**: just `{"answer": "<string>"}`. `records_considered` is computed by 5.3's handler, not the model.
-- **Empty records list is valid input** — model says "no data yet".
-- moto doesn't support bedrock-runtime — same `patch.object` pattern as 4.3.
+- `temperature=0.3` (synthesis produces prose), `max_tokens=1024` (tool use JSON is verbose).
+- **Response schema** for final answer: just `{"answer": "<string>"}`. `records_considered` is tracked by the loop, not the model.
+- **MAX_TOOL_TURNS=3**: prevents runaway tool call loops. Most real queries need 1-2 tool calls.
+- **Layer 2 retry**: if final answer isn't valid `{"answer": "..."}` JSON, restart entire conversation with `RETRY_SYSTEM_PROMPT`. This is simpler than resuming mid-conversation.
+- **Multiple tool calls in one response**: Bedrock can return multiple `tool_use` blocks. Handle all of them, send all `tool_result` blocks back in one message.
+- moto doesn't support bedrock-runtime — `patch.object(synthesize.bedrock, "invoke_model", side_effect=[...])` with a sequence of mock responses.
 
 </details>
 
@@ -2070,32 +2226,50 @@ def test_insights_config_is_distinct():
 
 | # | Test | Why it matters |
 |---|------|----------------|
-| 1 | Valid `{"answer": "..."}` on attempt 1 → `{"answer": "...", "synthesis_failed": False}`, 1 call | Happy path |
-| 2 | Invalid on attempt 1, valid on attempt 2 → returns attempt-2 result | Layer 2 retry |
-| 3 | Invalid on both → `{"answer": None, "synthesis_failed": True}` | DR8 fallback |
-| 4 | `"answer"` missing or not a string → treated as invalid | Validation beyond json.loads |
-| 5 | `records=[]` → Bedrock still invoked | "No data → model says so" design |
-| 6 | `invoke_model` called with `temperature=0.3` and `max_tokens=400` | Pins synthesis-specific values |
-| 7 | **Boundary**: `INSIGHTS_BEDROCK_CONFIG` is different object from `BEDROCK_CONFIG` with `max_attempts=2`, `read_timeout=5` | Regression |
+| 1 | Single tool call: model requests `query_triage_data(sentiment="negative")`, gets results, returns valid `{"answer": "..."}` | Happy path — one tool call, one answer |
+| 2 | Two sequential tool calls (e.g., billing then bug_report), then valid answer | Multi-tool-call path |
+| 3 | Model returns answer directly without tool use (`stop_reason="end_turn"` on first response) | No-tool-call path still works |
+| 4 | Final answer is invalid JSON on attempt 1, valid on attempt 2 (Layer 2 retry) | Retry mechanism |
+| 5 | Both attempts fail → `{"answer": None, "records_considered": 0, "synthesis_failed": True}` | DR8 fallback |
+| 6 | Tool use loop exceeds `MAX_TOOL_TURNS` → treated as failure, triggers retry | Runaway protection |
+| 7 | `records_considered` accumulates across multiple tool calls | Counter correctness |
+| 8 | `query_fn` called with exact kwargs from tool input | Tool input passthrough |
+| 9 | `invoke_model` request body includes `"tools"` key with `QUERY_TOOL` | Contract verification |
+| 10 | Messages list correctly builds multi-turn conversation (user → assistant(tool_use) → user(tool_result) → assistant(end_turn)) | Message threading |
+| 11 | **Boundary**: `INSIGHTS_BEDROCK_CONFIG` is different object from `BEDROCK_CONFIG` with `max_attempts=2`, `read_timeout=5` | Regression |
+| 12 | `temperature=0.3` and `max_tokens=1024` in invoke request | Parameter verification |
 
-Helper: reuses 4.3's `mock_bedrock_response(text)` pattern.
+Helpers: `mock_tool_use_response(tool_calls)` and `mock_final_response(text)` — two separate helpers for the two response shapes. `query_fn` is a `unittest.mock.Mock` returning canned records.
 
 **Implementation**
 
-`_invoke(records, question, system_prompt) -> str`
-1. User content: `f"Records: {json.dumps(records)}\n\nQuestion: {question}"`.
-2. `invoke_model(...)` with `max_tokens=400`, `temperature=0.3`.
-3. First decode → return `content[0]["text"]`.
+`_extract_tool_calls(content: list[dict]) -> list[dict]`
+- Filter blocks to `type == "tool_use"`. Return list.
 
-`_try_parse(raw_text) -> dict | None`
+`_extract_text(content: list[dict]) -> str | None`
+- Find first block with `type == "text"`. Return its `"text"` value, or `None`.
+
+`_try_parse(raw_text: str) -> dict | None`
 1. `json.loads`, catch error → `None`.
 2. Valid only if `"answer"` exists and is a `str`.
 3. Return `{"answer": parsed["answer"]}` if valid, else `None`.
 
-`synthesize(records, question) -> dict`
-1. Attempt 1 → `_try_parse`. If valid: `{"answer": ..., "synthesis_failed": False}`.
-2. Attempt 2 with `RETRY_SYSTEM_PROMPT` → `_try_parse`. If valid: same.
-3. Both failed: `{"answer": None, "synthesis_failed": True}`.
+`_invoke_with_tools(question, system_prompt, query_fn) -> tuple[str | None, int]`
+1. `messages = [{"role": "user", "content": question}]`.
+2. `records_considered = 0`.
+3. Loop up to `MAX_TOOL_TURNS`:
+   a. `invoke_model(...)` with `tools=[QUERY_TOOL]`, `messages`, `temperature=0.3`, `max_tokens=1024`.
+   b. `response_body = json.loads(response["body"].read())`.
+   c. If `stop_reason == "end_turn"`: return `(_extract_text(content), records_considered)`.
+   d. If `stop_reason == "tool_use"`: extract tool calls, execute each via `query_fn(**input)`, accumulate `records_considered`, append assistant + tool_result messages, continue loop.
+4. Loop exhausted: return `(None, 0)`.
+
+`synthesize(question, query_fn) -> dict`
+1. Attempt 1: `_invoke_with_tools(question, SYSTEM_PROMPT, query_fn)` → `_try_parse(text)`.
+2. If valid: `{"answer": ..., "records_considered": N, "synthesis_failed": False}`.
+3. Attempt 2: `_invoke_with_tools(question, RETRY_SYSTEM_PROMPT, query_fn)` → `_try_parse(text)`.
+4. If valid: same.
+5. Both failed: `{"answer": None, "records_considered": 0, "synthesis_failed": True}`.
 
 </details>
 
@@ -2103,16 +2277,16 @@ Helper: reuses 4.3's `mock_bedrock_response(text)` pattern.
 
 ### 5.3 `handler.py`
 
-**Goal:** API Gateway Lambda proxy handler — parse request, query DynamoDB, synthesize answer, return 200 or 503 with correct response shape.
+**Goal:** API Gateway Lambda proxy handler — parse request, pass question + query function to synthesize, return 200 or 503 with correct response shape.
 
-**Prereqs:** 5.1 + 5.2 green. Double-mocking: `mock_aws()` for DynamoDB (via `query`) + `patch.object(synthesize.bedrock, ...)`.
+**Prereqs:** 5.2 green. **Simplified mocking:** handler delegates everything to `synthesize.synthesize()`, so tests only need to `patch.object(synthesize, "synthesize", ...)` — no DynamoDB or Bedrock mocking needed in handler tests.
 
 **Signatures (build these):**
 
 ```
 src/lambda_insights/handler.py
 
-import json
+import json, time
 import query, synthesize
 
 def _emit_synthesis_failure_emf() -> None: ...
@@ -2121,11 +2295,11 @@ def handler(event, context): ...
 
 **TDD Order (Red → Green):**
 1. test #1 (happy path → 200 + correct body) → build handler skeleton
-2. test #4 + #5 (API Gateway proxy shape: string body, correct return keys) → add `json.loads(event["body"])` + response shaping
-3. test #3 (empty records → 200 + `records_considered=0`) → should pass already
+2. test #3 + #4 (API Gateway proxy shape: string body, correct return keys) → add `json.loads(event["body"])` + response shaping
+3. test #5 (records_considered=0 on success → 200) → should pass already
 4. test #2 (synthesis_failed → 503 + EMF) → add failure branch + `_emit_synthesis_failure_emf`
-5. test #7 (no EMF on 200 path) → should pass already
-6. test #6 (Scan raises → propagates uncaught, not 503) → confirm no try/except on query
+5. test #6 (no EMF on 200 path) → should pass already
+6. test #7 (`query.query_triage_data` passed as query_fn) → verify wiring
 
 **External Docs:**
 - [API Gateway Lambda proxy integration](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-proxy-integrations.html)
@@ -2148,6 +2322,10 @@ event = {
 request_body = json.loads(event["body"])
 question = request_body["question"]
 
+# HANDLER CALLS synthesize with query_fn (dependency injection):
+result = synthesize.synthesize(question, query.query_triage_data)
+# result = {"answer": "...", "records_considered": N, "synthesis_failed": False}
+
 # OUTPUT — 200 response (synthesis succeeded):
 {
     "statusCode": 200,
@@ -2166,11 +2344,11 @@ question = request_body["question"]
 # OUTPUT — 503 response (synthesis failed after retries):
 {
     "statusCode": 503,
-    "body": '{"error": "synthesis_unavailable", "records_considered": 12}',
+    "body": '{"error": "synthesis_unavailable", "records_considered": 0}',
     "headers": {"Content-Type": "application/json"}
 }
 
-# OUTPUT — 502 (DynamoDB Scan raises → uncaught → API Gateway generic 502):
+# OUTPUT — 502 (DynamoDB Scan raises inside synthesize → uncaught → API Gateway generic 502):
 # NOT generated by this handler — it's what API Gateway returns when Lambda raises
 
 # ─── INTERNAL HELPER SHAPES ───
@@ -2182,23 +2360,35 @@ question = request_body["question"]
 # Note: Dimensions is [[]] — no dimensions, unlike 4.6's [["sentiment"]]
 ```
 
-**Sample Code — proxy integration response format:**
+**Sample Code — simplified handler (no direct query call):**
 
 ```python
-# 200 — success:
-return {
-    "statusCode": 200,
-    "body": json.dumps({"answer": "The most common...", "records_considered": 12}),
-    "headers": {"Content-Type": "application/json"}
-}
+def handler(event, context):
+    request_body = json.loads(event["body"])
+    question = request_body["question"]
 
-# 503 — synthesis failed (Bedrock exhausted retries):
-return {
-    "statusCode": 503,
-    "body": json.dumps({"error": "synthesis_unavailable", "records_considered": 12}),
-    "headers": {"Content-Type": "application/json"}
-}
-# Note: body must be a STRING (json.dumps), not a raw dict!
+    # Bedrock drives the queries via tool use — handler just passes the function
+    result = synthesize.synthesize(question, query.query_triage_data)
+
+    if not result["synthesis_failed"]:
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "answer": result["answer"],
+                "records_considered": result["records_considered"],
+            }),
+            "headers": {"Content-Type": "application/json"},
+        }
+    else:
+        _emit_synthesis_failure_emf()
+        return {
+            "statusCode": 503,
+            "body": json.dumps({
+                "error": "synthesis_unavailable",
+                "records_considered": result["records_considered"],
+            }),
+            "headers": {"Content-Type": "application/json"},
+        }
 ```
 
 **Sample Code — SynthesisFailure EMF (no dimensions):**
@@ -2206,7 +2396,7 @@ return {
 ```python
 emf_document = {
     "_aws": {
-        "Timestamp": 1719000000000,
+        "Timestamp": int(time.time() * 1000),
         "CloudWatchMetrics": [{
             "Namespace": "ECHO",
             "Dimensions": [[]],  # empty — no dimensions for this metric
@@ -2218,15 +2408,38 @@ emf_document = {
 print(json.dumps(emf_document))
 ```
 
-> **Context digest:** `event["body"]` is a JSON **string** (proxy integration). Return must be `{"statusCode": int, "body": <JSON string>, "headers": {...}}`. 503 is specifically for `synthesis_failed=True` — DynamoDB Scan failure RAISEs (→ API Gateway 502). `records_considered = len(records)` included in both 200 and 503.
+**Sample Code — test pattern (mock synthesize, not Bedrock):**
+
+```python
+from unittest.mock import patch
+import synthesize, query
+
+def test_happy_path():
+    event = {"body": json.dumps({"question": "What are the trends?"})}
+    with patch.object(synthesize, "synthesize", return_value={
+        "answer": "Billing is the top category.",
+        "records_considered": 5,
+        "synthesis_failed": False,
+    }) as mock_synth:
+        result = handler.handler(event, None)
+        assert result["statusCode"] == 200
+        body = json.loads(result["body"])
+        assert body["answer"] == "Billing is the top category."
+        assert body["records_considered"] == 5
+        # Verify query_fn wiring:
+        mock_synth.assert_called_once_with("What are the trends?", query.query_triage_data)
+```
+
+> **Context digest:** Handler is simplified compared to original design — no longer calls `query` directly. Passes `query.query_triage_data` as a callable to `synthesize.synthesize()`. `records_considered` comes from synthesize's return value. Response shapes unchanged (200/503). DynamoDB errors propagate through synthesize uncaught → API Gateway 502. Tests only mock `synthesize.synthesize` — no DynamoDB or Bedrock mocking needed.
 
 <details><summary><b>Background & design decisions</b></summary>
 
 - **API Gateway Lambda proxy integration** (`AWS_PROXY`): `event["body"]` is a JSON string. Return value must be `{"statusCode": int, "body": <JSON string>, "headers": {...}}`.
-- **Orchestration**: `query.get_auto_processed_records()` → `synthesize.synthesize(records, question)` → shape response.
-- **503 is not a catch-all** — specifically the outcome when Bedrock synthesis exhausts retry. DynamoDB Scan failure RAISEs (→ API Gateway 502).
+- **Simplified orchestration**: handler passes `query.query_triage_data` as `query_fn` to `synthesize.synthesize()`. Bedrock drives the queries via tool use inside synthesize.
+- **503 is not a catch-all** — specifically the outcome when `synthesis_failed=True`. DynamoDB Scan failure RAISEs through synthesize (→ API Gateway 502).
 - No idempotency guard — synchronous, read-only request.
 - `SynthesisFailure` EMF metric on 503 path only — no dimensions.
+- **Testing is simpler than the original design**: only `patch.object(synthesize, "synthesize", ...)` needed. No `@mock_aws`, no Bedrock mocking. Handler tests verify orchestration wiring and response shaping.
 
 </details>
 
@@ -2238,11 +2451,11 @@ print(json.dumps(emf_document))
 |---|------|----------------|
 | 1 | Happy path → `statusCode=200`, body = `{"answer": "...", "records_considered": N}` | Core contract |
 | 2 | `synthesis_failed=True` → `statusCode=503`, body = `{"error": "synthesis_unavailable", "records_considered": N}` + EMF | DR8 |
-| 3 | Empty records → 200, `records_considered=0` | "No data" ≠ "failed" |
-| 4 | `event["body"]` is a JSON string → handler json.loads it | Proxy integration shape |
-| 5 | Response has exactly `statusCode`, `body` (str), `headers` | Return contract |
-| 6 | **Boundary**: Scan raises → propagates uncaught (not 503) | Infrastructure → 502 vs application → 503 |
-| 7 | On 200 path, no `SynthesisFailure` EMF line printed | Conditional metric |
+| 3 | `event["body"]` is a JSON string → handler json.loads it | Proxy integration shape |
+| 4 | Response has exactly `statusCode`, `body` (str), `headers` | Return contract |
+| 5 | `records_considered=0` on success → 200 (not failure) | "No data" ≠ "failed" |
+| 6 | On 200 path, no `SynthesisFailure` EMF line printed | Conditional metric |
+| 7 | `query.query_triage_data` is passed as the `query_fn` argument to `synthesize.synthesize` | Wiring check |
 
 **Implementation**
 
@@ -2253,11 +2466,9 @@ print(json.dumps(emf_document))
 `handler(event, context)`
 1. `request_body = json.loads(event["body"])`.
 2. `question = request_body["question"]`.
-3. `records = query.get_auto_processed_records()`.
-4. `records_considered = len(records)`.
-5. `result = synthesize.synthesize(records, question)`.
-6. If not `synthesis_failed`: return 200 + `{"answer": ..., "records_considered": ...}`.
-7. Else: `_emit_synthesis_failure_emf()`, return 503 + `{"error": "synthesis_unavailable", "records_considered": ...}`.
+3. `result = synthesize.synthesize(question, query.query_triage_data)`.
+4. If not `synthesis_failed`: return 200 + `{"answer": result["answer"], "records_considered": result["records_considered"]}`.
+5. Else: `_emit_synthesis_failure_emf()`, return 503 + `{"error": "synthesis_unavailable", "records_considered": result["records_considered"]}`.
 
 </details>
 
