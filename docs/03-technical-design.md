@@ -93,13 +93,14 @@ Support Lead
            ▼
 ┌──────────────────────────┐
 │ Lambda #3 (insights)       │
-│ 1. Scan EmailTriageResults │──────► DynamoDB: EmailTriageResults
-│    (review_status=         │         (review_status=auto_processed,
-│    auto_processed),         │          projected fields only)
-│    project minimal fields   │
-│ 2. Bedrock synthesize       │──────► Bedrock (Claude Haiku)
-│    answer from records       │
-│    + question                │
+│ 1. Bedrock tool use loop   │──────► Bedrock (Claude Haiku)
+│    - model decides what     │         (tool use: query_triage_data)
+│      to query via tool      │
+│    - tool calls Scan        │──────► DynamoDB: EmailTriageResults
+│      EmailTriageResults     │         (parameterized filters,
+│      with filters           │          9 projected fields)
+│ 2. Model synthesizes        │
+│    answer from results      │
 └──────────┬─────────────────┘
            │ {"answer": "...", "records_considered": N}
            ▼
@@ -158,8 +159,8 @@ Fully serverless, no VPC. Every component is either an AWS-managed service endpo
 21. The support lead sends a SigV4-signed `POST /insights` (`{"question": "..."}`) to API Gateway.
 22. API Gateway's `AWS_IAM` authorizer validates the signature; unauthenticated/unauthorized requests get HTTP 403 (FR16).
 23. API Gateway invokes Lambda #3 (insights) with the request body.
-24. Lambda #3 `Scan`s `EmailTriageResults` filtered to `review_status=auto_processed`, projecting only `category`, `urgency`, `sentiment`, `feature_tags`, `received_at` (data minimization).
-25. Lambda #3 sends the projected records + question to Bedrock (Claude Haiku) for synthesis.
+24. Lambda #3 passes the user's `question` and a `query_triage_data` callable to Bedrock (Claude Haiku) via a tool use loop. Bedrock decides what to query based on the question — it calls the `query_triage_data` tool with optional filters (`category`, `sentiment`, `urgency`, `from_address`, `date_from`, `date_to`), which `Scan`s `EmailTriageResults` filtered to `review_status=auto_processed` plus any requested filters, projecting up to 9 fields (`email_id`, `from_address`, `subject`, `redacted_body`, `category`, `urgency`, `sentiment`, `feature_tags`, `received_at`). Bedrock may call the tool multiple times with different filters (e.g., to compare categories).
+25. Bedrock synthesizes a natural-language answer from the queried results.
 26. *(Layer 2 retry)* Same Bedrock response-validation retry as step 12 (2 attempts), using Lambda #3's tightened Bedrock client config (§7.3) so worst-case retry time fits its 28s budget. On exhaustion, Lambda #3 returns the `/insights` failure response instead (§7.3, DR8).
 27. Lambda #3 returns `{"answer": "...", "records_considered": N}` via API Gateway to the support lead.
 28. X-Ray captures a trace segment (not `email_id`-correlated — `/insights` is an aggregate query, but still part of the service map).
@@ -326,8 +327,8 @@ src/
 │   └── persist.py              — idempotency GetItem + DynamoDB PutItem
 ├── lambda_insights/        (Lambda #3)
 │   ├── handler.py
-│   ├── query.py               — DynamoDB Scan + field projection (§2.2 step 24)
-│   └── synthesize.py           — Bedrock invoke + Layer 2 retry (§4.3)
+│   ├── query.py               — DynamoDB Scan + field projection; `get_auto_processed_records()` (5 fields) + `query_triage_data()` (parameterized, 9 fields, used by Bedrock tool use)
+│   └── synthesize.py           — Bedrock tool use loop + Layer 2 retry (§4.3); model calls `query_triage_data` tool to fetch records on-demand
 └── layers/shared_utils/
     └── retry_config.py          — GENERAL_CONFIG and BEDROCK_CONFIG (§4.2)
 ```
@@ -654,7 +655,7 @@ POST /insights
   "records_considered": 42
 }
 ```
-`records_considered` is the count of `review_status=auto_processed` records returned by step 24's Scan — included even on a "no data" answer (e.g., `records_considered: 0`) so the caller can distinguish "nothing happened yet" from "synthesis failed" (§7.3).
+`records_considered` is the total count of `review_status=auto_processed` records examined across all of Bedrock's tool-use calls in step 24 — included even on a "no data" answer (e.g., `records_considered: 0`) so the caller can distinguish "nothing happened yet" from "synthesis failed" (§7.3). If Bedrock makes multiple tool calls (e.g., querying billing then bug_report separately), `records_considered` is the sum across all calls.
 
 ### 7.3 Lambda #3 Failure Response (DR8) & the 28s Budget
 
@@ -669,7 +670,7 @@ This resolves the open item flagged since §5.4: what `/insights` returns when B
 **Worst-case timing derivation** (why this fits the 28s Lambda timeout, §5.4):
 - Each Layer 2 attempt's Bedrock call: Layer 1 retries up to 2× at 5s `read_timeout` = **10s worst case per attempt**
 - Layer 2 = 2 attempts total = **~20s** worst-case Bedrock time, + ~0.5s jittered backoff between them ≈ **20.5s**
-- + DynamoDB Scan (small table, ~1s worst case at demo scale) ≈ **~21.5s total**
+- + DynamoDB Scans via tool use (1–3 Scans depending on question complexity, ~1s each at demo scale) ≈ **~21.5–23.5s total**
 - Leaves **~6.5s headroom** under the 28s timeout for cold start, JSON parsing, and Lambda runtime overhead
 
 This guarantees Lambda #3 *always* finishes within its own 28s timeout and returns its own response — it never relies on API Gateway's 504 or a Lambda-service `Task timed out` 502.
@@ -681,7 +682,7 @@ This guarantees Lambda #3 *always* finishes within its own 28s timeout and retur
   "records_considered": 42
 }
 ```
-503 (not 500) signals a transient downstream-dependency issue — Bedrock throttling/instability is the most likely cause, and the same `question` may succeed on a retry. `records_considered` is still returned: the Scan succeeded, only synthesis degraded, so the caller learns data exists even though no answer could be generated.
+503 (not 500) signals a transient downstream-dependency issue — Bedrock throttling/instability is the most likely cause, and the same `question` may succeed on a retry. `records_considered` reflects the total records examined across all tool-use calls before synthesis failed; it may be 0 if Bedrock never got to query DynamoDB.
 
 Lambda #3 also emits a `SynthesisFailure` EMF metric on this path (DR8) — the `/insights`-side counterpart to Lambda #2's `ClassificationFailure` (DR7), feeding the same observability/alerting pattern (FR11/FR15).
 
@@ -759,7 +760,7 @@ Attributes (all non-key attributes are schemaless under DynamoDB's model — lis
 | `processed_at` | S (ISO 8601) | Lambda #2 | |
 | `ttl` | N | Lambda #2 | see above |
 
-This is the single table in the design — Lambda #2 writes one item per email (step 15), Lambda #3 only reads via `Scan` (step 24, doc02 §4 decision #4 covers why Scan-and-filter rather than a GSI).
+This is the single table in the design — Lambda #2 writes one item per email (step 15), Lambda #3 only reads via `Scan` (step 24, doc02 §4 decision #4 covers why Scan-and-filter rather than a GSI). Lambda #3's Bedrock tool use may issue multiple parameterized Scans per request (with filters on `category`, `sentiment`, `urgency`, `from_address`, `received_at`).
 
 ### 8.6 API Gateway
 

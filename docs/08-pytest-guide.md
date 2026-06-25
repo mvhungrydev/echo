@@ -107,8 +107,9 @@ aws_credentials  (function-scoped, no AWS calls)
    ├── triage_handler        → reload: persist, pii, classify,
    │                            keyword_rules, then handler             (DynamoDB + SNS,
    │                                                                       + patch Comprehend/Bedrock)
-   └── insights_handler      → reload: query, synthesize, then handler  (DynamoDB,
-                                                                            + patch Bedrock)
+   └── insights_handler      → reload: query, synthesize, then handler  (DynamoDB;
+                                handler passes query.query_triage_data   + patch Bedrock
+                                as callable to synthesize via dep injection)
 ```
 
 `test_retry_config.py`, `test_mime_parser.py`, and `test_keyword_rules.py` use **none** of these fixtures — they're pure-Python, self-contained (doc06 2.1/3.1/4.1).
@@ -144,14 +145,14 @@ No sibling-module reload chain: `handler.py` (3.2) only does `from mime_parser i
 
 Individual tests then layer `patch.object(handler.pii.comprehend, "detect_pii_entities", return_value=...)` and/or `patch.object(handler.classify.bedrock, "invoke_model", return_value=...)` — per-test, since each test needs different Comprehend/Bedrock responses (this is Pattern D, §6.4).
 
-**`insights_handler`** (Phase 5.1/5.3) — same shape as `triage_handler`, narrower:
+**`insights_handler`** (Phase 5.1/5.3) — same shape as `triage_handler`, but simpler mocking:
 
 1. Enter `mock_aws()`, create the same `EmailTriageResults`-shaped table, set `DYNAMODB_TABLE_NAME`.
 2. `importlib.reload(query)`, `importlib.reload(synthesize)`.
 3. Bring `handler` into this test's state (§4.4).
 4. `yield handler`.
 
-Tests layer `patch.object(handler.synthesize.bedrock, "invoke_model", ...)` per-test.
+**Key wiring change**: handler passes `query.query_triage_data` as a callable (`query_fn`) to `synthesize.synthesize()`. Bedrock drives the queries via tool use inside synthesize — handler never calls query directly. Handler tests can mock `synthesize.synthesize` directly (no DynamoDB or Bedrock mocking needed). Synthesize tests use a `Mock` for `query_fn` and `patch.object(synthesize.bedrock, "invoke_model", ...)` for Bedrock.
 
 ### 4.3 What goes in the test itself vs. the fixture
 
