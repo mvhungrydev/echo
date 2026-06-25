@@ -795,9 +795,10 @@ Prompt construction (system prompt = output-schema contract, user message = reda
 | --- | --- | --- |
 | API | `DetectPiiEntities` | synchronous, single call per email (step 10) |
 | `LanguageCode` | `en` | hardcoded — multi-language is out of scope (doc01 §6) |
-| Redaction rule | replace each returned entity's `[BeginOffset, EndOffset)` span with `[<Type>]` (e.g. `[NAME]`, `[EMAIL]`, `[PHONE]`) | applied for every entity type Comprehend returns — no type allowlist, simplest defensible "redact everything flagged" policy for a security demo |
+| Redaction rule | replace each returned entity's `[BeginOffset, EndOffset)` span with `[<Type>]` (e.g. `[SSN]`, `[ADDRESS]`) | applied to entities that pass both gates below |
+| `PII_TYPES_TO_SKIP` | `{"NAME", "EMAIL", "PHONE"}` | these types are intentionally preserved — names and sender addresses aid human review; phone numbers are contact details the support agent needs for follow-up. All other types (SSN, ADDRESS, DATE_TIME, CREDIT_DEBIT_NUMBER, etc.) are redacted. |
 | Score threshold | `Score >= 0.5` | Comprehend's own commonly-cited default for acting on a detection; entities below this are left as-is rather than over-redacting on low-confidence matches |
-| Metric | `pii_entities_detected` = count of entities at/above the threshold | feeds FR11/§8.5 |
+| Metric | `pii_entities_detected` = count of entities that pass both gates (above threshold AND not in `PII_TYPES_TO_SKIP`) | feeds FR11/§8.5 |
 
 ### 8.9 Observability Stack
 

@@ -12,12 +12,12 @@
 | 3.2 | `lambda_ingest/handler.py` | DONE | 3.1, 2.1 |
 | 4.1 | `lambda_triage/keyword_rules.py` | DONE | — |
 | 4.2 | `lambda_triage/pii.py` | DONE | 2.1 |
-| 4.3 | `lambda_triage/classify.py` | ◀ NEXT | 2.1 |
-| 4.4 | `lambda_triage/persist.py` | TODO | 2.1 |
-| 4.5 | `lambda_triage/handler.py` (orchestration) | TODO | 4.1–4.4 |
-| 4.6 | `lambda_triage/handler.py` (alerting + EMF) | TODO | 4.5 |
-| 5.1 | `lambda_insights/query.py` (parameterized + original) | DONE (original) / ◀ NEXT (parameterized) | 2.1 |
-| 5.2 | `lambda_insights/synthesize.py` (Bedrock tool use) | TODO | 5.1 |
+| 4.3 | `lambda_triage/classify.py` | DONE | 2.1 |
+| 4.4 | `lambda_triage/persist.py` | DONE | 2.1 |
+| 4.5 | `lambda_triage/handler.py` (orchestration) | DONE | 4.1–4.4 |
+| 4.6 | `lambda_triage/handler.py` (alerting + EMF) | DONE | 4.5 |
+| 5.1 | `lambda_insights/query.py` (parameterized + original) | DONE | 2.1 |
+| 5.2 | `lambda_insights/synthesize.py` (Bedrock tool use) | ◀ NEXT | 5.1 |
 | 5.3 | `lambda_insights/handler.py` | TODO | 5.2 |
 | 6.1 | `infra/modules/s3` | TODO | — |
 | 6.2 | `infra/modules/ses` | TODO | 6.1 |
