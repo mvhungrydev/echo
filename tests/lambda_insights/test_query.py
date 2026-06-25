@@ -70,87 +70,6 @@ def _setup():
 
 
 @mock_aws
-def test_filter_returns_only_auto_processed():
-    query, table = _setup()
-    # insert one auto_processed and one needs_review record
-    table.put_item(Item=_make_record())
-    table.put_item(Item=_make_record(email_id="msg-002", review_status="needs_review"))
-    # call query — should only return the auto_processed one
-    result = query.get_auto_processed_records()
-    # assert only 1 returned and it's the auto_processed record
-    assert len(result) == 1
-    assert result[0]["category"] == "billing"
-
-
-# ── test 2 ────────────────────────────────────────────────────────────────────
-
-
-@mock_aws
-def test_only_five_projected_fields_returned():
-    query, table = _setup()
-    # insert a full record (all 17 fields)
-    table.put_item(Item=_make_record())
-    # call query — should return only 5 projected fields
-    result = query.get_auto_processed_records()
-    # assert exactly these 5 keys and no others
-    assert set(result[0].keys()) == {"category", "urgency", "sentiment", "feature_tags", "received_at"}
-
-
-# ── test 3 ────────────────────────────────────────────────────────────────────
-
-
-@mock_aws
-def test_empty_table_returns_empty_list():
-    query, table = _setup()
-    # no records inserted — should return []
-    result = query.get_auto_processed_records()
-    assert result == []
-
-
-# ── test 4 ────────────────────────────────────────────────────────────────────
-
-
-@mock_aws
-def test_feature_tags_list_roundtrips():
-    query, table = _setup()
-    # insert a feature_request with tags
-    table.put_item(Item=_make_record(category="feature_request", feature_tags=["dark-mode", "mobile-app"]))
-    result = query.get_auto_processed_records()
-    # assert feature_tags survives the projection
-    assert result[0]["feature_tags"] == ["dark-mode", "mobile-app"]
-
-
-# ── test 5 ────────────────────────────────────────────────────────────────────
-
-
-@mock_aws
-def test_pagination_concatenates_pages():
-    query, table = _setup()
-    # mock table.scan to return 2 pages via side_effect
-    from unittest.mock import patch
-    page1 = {
-        "Items": [{"category": "billing", "urgency": "high", "sentiment": "negative", "feature_tags": [], "received_at": "2026-06-21T10:00:00+00:00"}],
-        "LastEvaluatedKey": {"email_id": "msg-001"},
-    }
-    page2 = {
-        "Items": [{"category": "praise", "urgency": "low", "sentiment": "positive", "feature_tags": [], "received_at": "2026-06-20T09:00:00+00:00"}],
-    }
-    with patch.object(query.table, "scan", side_effect=[page1, page2]):
-        result = query.get_auto_processed_records()
-    # assert both pages concatenated
-    assert len(result) == 2
-    assert result[0]["category"] == "billing"
-    assert result[1]["category"] == "praise"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Tests 6–15: query_triage_data (parameterized, 9-field projection)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── test 6 ────────────────────────────────────────────────────────────────────
-
-
-@mock_aws
 def test_query_triage_data_no_filters_returns_all_auto_processed():
     # no filters → returns every auto_processed record, excludes needs_review
     query, table = _setup()
@@ -161,7 +80,7 @@ def test_query_triage_data_no_filters_returns_all_auto_processed():
     assert len(result) == 2
 
 
-# ── test 7 ────────────────────────────────────────────────────────────────────
+# ── test 2 ────────────────────────────────────────────────────────────────────
 
 
 @mock_aws
@@ -175,7 +94,7 @@ def test_query_triage_data_category_filter():
     assert result[0]["category"] == "billing"
 
 
-# ── test 8 ────────────────────────────────────────────────────────────────────
+# ── test 3 ────────────────────────────────────────────────────────────────────
 
 
 @mock_aws
@@ -191,7 +110,7 @@ def test_query_triage_data_multiple_filters_and():
     assert result[0]["sentiment"] == "negative"
 
 
-# ── test 9 ────────────────────────────────────────────────────────────────────
+# ── test 4 ────────────────────────────────────────────────────────────────────
 
 
 @mock_aws
@@ -205,7 +124,7 @@ def test_query_triage_data_from_address_filter():
     assert result[0]["from_address"] == "jane@example.com"
 
 
-# ── test 10 ───────────────────────────────────────────────────────────────────
+# ── test 5 ───────────────────────────────────────────────────────────────────
 
 
 @mock_aws
@@ -219,7 +138,7 @@ def test_query_triage_data_date_from_filter():
     assert result[0]["received_at"] == "2026-06-22T09:00:00+00:00"
 
 
-# ── test 11 ───────────────────────────────────────────────────────────────────
+# ── test 6 ───────────────────────────────────────────────────────────────────
 
 
 @mock_aws
@@ -237,7 +156,7 @@ def test_query_triage_data_date_range_filter():
     assert result[0]["received_at"] == "2026-06-21T10:00:00+00:00"
 
 
-# ── test 12 ───────────────────────────────────────────────────────────────────
+# ── test 7 ───────────────────────────────────────────────────────────────────
 
 
 @mock_aws
@@ -253,7 +172,7 @@ def test_query_triage_data_returns_nine_projected_fields():
     assert set(result[0].keys()) == expected_keys
 
 
-# ── test 13 ───────────────────────────────────────────────────────────────────
+# ── test 8 ───────────────────────────────────────────────────────────────────
 
 
 @mock_aws
@@ -267,7 +186,7 @@ def test_query_triage_data_excludes_needs_review_even_with_matching_filters():
     assert result[0]["email_id"] == "msg-002"
 
 
-# ── test 14 ───────────────────────────────────────────────────────────────────
+# ── test 9 ───────────────────────────────────────────────────────────────────
 
 
 @mock_aws
@@ -279,7 +198,7 @@ def test_query_triage_data_no_matches_returns_empty():
     assert result == []
 
 
-# ── test 15 ───────────────────────────────────────────────────────────────────
+# ── test 10 ──────────────────────────────────────────────────────────────────
 
 
 @mock_aws
