@@ -19,7 +19,7 @@ sys.path.insert(
     ),
 )
 
-import synthesize
+import handler
 from retry_config import BEDROCK_CONFIG
 
 
@@ -130,13 +130,13 @@ def test_messages_multi_turn_shape():
 # ── test 11: INSIGHTS_BEDROCK_CONFIG distinct from shared BEDROCK_CONFIG ──────
 def test_insights_config_is_distinct_from_shared():
     # regression boundary — ensures synthesize uses its own tighter config
-    print(f"[test] INSIGHTS retries: {synthesize.INSIGHTS_BEDROCK_CONFIG.retries}")
-    print(f"[test] INSIGHTS read_timeout: {synthesize.INSIGHTS_BEDROCK_CONFIG.read_timeout}")
+    print(f"[test] INSIGHTS retries: {handler.INSIGHTS_BEDROCK_CONFIG.retries}")
+    print(f"[test] INSIGHTS read_timeout: {handler.INSIGHTS_BEDROCK_CONFIG.read_timeout}")
     print(f"[test] shared BEDROCK retries: {BEDROCK_CONFIG.retries}")
     print(f"[test] shared BEDROCK read_timeout: {BEDROCK_CONFIG.read_timeout}")
-    assert synthesize.INSIGHTS_BEDROCK_CONFIG is not BEDROCK_CONFIG
-    assert synthesize.INSIGHTS_BEDROCK_CONFIG.retries == {"max_attempts": 2, "mode": "adaptive"}
-    assert synthesize.INSIGHTS_BEDROCK_CONFIG.read_timeout == 5
+    assert handler.INSIGHTS_BEDROCK_CONFIG is not BEDROCK_CONFIG
+    assert handler.INSIGHTS_BEDROCK_CONFIG.retries == {"max_attempts": 2, "mode": "adaptive"}
+    assert handler.INSIGHTS_BEDROCK_CONFIG.read_timeout == 5
 
 
 # ── test 12: temperature=0.3 and max_tokens=1024 in request ──────────────────
